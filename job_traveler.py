@@ -263,6 +263,24 @@ def print_traveler(job):
     print(f"Notes:         {blank_if_missing(job, 'shipping', 'notes')}")
 
 
+def print_job_status_summary(job):
+    print("\nJOB STATUS SUMMARY")
+    print("-" * 30)
+    print(f"Job Number:   {job_field(job, 'job_number')}")
+    print(f"Customer:     {job_field(job, 'customer')}")
+    print(f"Part Number:  {job_field(job, 'part_number')}")
+    print(f"Qty To Make:  {job_field(job, 'qty_to_make')}")
+
+    print()
+    print(f"Programming:    {blank_if_missing(job, 'programming', 'status')}")
+    print(f"Saw Cutting:    {blank_if_missing(job, 'saw_cutting', 'status')}")
+    print(f"CNC Machining:  {blank_if_missing(job, 'cnc_machining', 'status')}")
+    print(f"Deburr:         {blank_if_missing(job, 'deburr', 'status')}")
+    print(f"Inspection:     {blank_if_missing(job, 'inspection', 'status')}")
+    print(f"Packing:        {blank_if_missing(job, 'packing', 'status')}")
+    print(f"Shipping:       {blank_if_missing(job, 'shipping', 'status')}")
+
+
 def update_programming(job):
     print("\nUpdate Programming")
     print("-" * 30)
@@ -425,7 +443,8 @@ def job_menu(job):
         print("6. Update Packing")
         print("7. Update Shipping")
         print("8. Print Traveler")
-        print("9. Save Job")
+        print("9. Print Status Summary")
+        print("10. Save Job")
         print("0. Exit to Main Menu")
 
         choice = input("Choose an option: ").strip()
@@ -461,6 +480,8 @@ def job_menu(job):
         elif choice == "8":
             print_traveler(job)
         elif choice == "9":
+            print_job_status_summary(job)
+        elif choice == "10":
             save_job(job)
         elif choice == "0":
             return
