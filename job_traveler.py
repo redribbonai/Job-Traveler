@@ -26,6 +26,42 @@ def get_int(prompt):
             print("Invalid number. Enter a whole number.")
 
 
+def has_existing_value(section_data, key):
+    value = section_data.get(key)
+    return value != "" and value is not None
+
+
+def get_existing_or_new(section_data, key, prompt):
+    if has_existing_value(section_data, key):
+        current_value = section_data[key]
+        raw = input(f"{prompt} [current: {current_value}]: ").strip()
+
+        if raw == "":
+            return current_value
+
+        return raw
+
+    return input(f"{prompt}: ").strip()
+
+
+def get_existing_int_or_new(section_data, key, prompt):
+    if has_existing_value(section_data, key):
+        current_value = section_data[key]
+
+        while True:
+            raw = input(f"{prompt} [current: {current_value}]: ").strip()
+
+            if raw == "":
+                return current_value
+
+            try:
+                return int(raw)
+            except ValueError:
+                print("Invalid number. Enter a whole number.")
+
+    return get_int(f"{prompt}: ")
+
+
 def save_job(job):
     os.makedirs(JOBS_FOLDER, exist_ok=True)
 
@@ -183,13 +219,15 @@ def update_programming(job):
     print("\nUpdate Programming")
     print("-" * 30)
 
+    programming = job["programming"]
+
     job["programming"] = {
-        "programmer": input("Programmer: ").strip(),
-        "program_name": input("Program Name: ").strip(),
-        "revision": input("Revision: ").strip(),
-        "machine": input("Machine: ").strip(),
-        "status": input("Status: ").strip(),
-        "notes": input("Notes: ").strip(),
+        "programmer": get_existing_or_new(programming, "programmer", "Programmer"),
+        "program_name": get_existing_or_new(programming, "program_name", "Program Name"),
+        "revision": get_existing_or_new(programming, "revision", "Revision"),
+        "machine": get_existing_or_new(programming, "machine", "Machine"),
+        "status": get_existing_or_new(programming, "status", "Status"),
+        "notes": get_existing_or_new(programming, "notes", "Notes"),
     }
 
     save_job(job)
@@ -199,13 +237,15 @@ def update_saw_cutting(job):
     print("\nUpdate Saw Cutting")
     print("-" * 30)
 
+    saw_cutting = job["saw_cutting"]
+
     job["saw_cutting"] = {
-        "employee": input("Employee: ").strip(),
-        "qty_cut": get_int("Qty Cut: "),
-        "cut_length": input("Cut Length: ").strip(),
-        "scrap_qty": get_int("Scrap Qty: "),
-        "status": input("Status: ").strip(),
-        "notes": input("Notes: ").strip(),
+        "employee": get_existing_or_new(saw_cutting, "employee", "Employee"),
+        "qty_cut": get_existing_int_or_new(saw_cutting, "qty_cut", "Qty Cut"),
+        "cut_length": get_existing_or_new(saw_cutting, "cut_length", "Cut Length"),
+        "scrap_qty": get_existing_int_or_new(saw_cutting, "scrap_qty", "Scrap Qty"),
+        "status": get_existing_or_new(saw_cutting, "status", "Status"),
+        "notes": get_existing_or_new(saw_cutting, "notes", "Notes"),
     }
 
     save_job(job)
@@ -215,14 +255,16 @@ def update_cnc_machining(job):
     print("\nUpdate CNC Machining")
     print("-" * 30)
 
+    cnc_machining = job["cnc_machining"]
+
     job["cnc_machining"] = {
-        "operator": input("Operator: ").strip(),
-        "machine": input("Machine: ").strip(),
-        "qty_completed": get_int("Qty Completed: "),
-        "qty_rejected": get_int("Qty Rejected: "),
-        "first_article": input("First Article: ").strip(),
-        "status": input("Status: ").strip(),
-        "notes": input("Notes: ").strip(),
+        "operator": get_existing_or_new(cnc_machining, "operator", "Operator"),
+        "machine": get_existing_or_new(cnc_machining, "machine", "Machine"),
+        "qty_completed": get_existing_int_or_new(cnc_machining, "qty_completed", "Qty Completed"),
+        "qty_rejected": get_existing_int_or_new(cnc_machining, "qty_rejected", "Qty Rejected"),
+        "first_article": get_existing_or_new(cnc_machining, "first_article", "First Article"),
+        "status": get_existing_or_new(cnc_machining, "status", "Status"),
+        "notes": get_existing_or_new(cnc_machining, "notes", "Notes"),
     }
 
     save_job(job)
@@ -232,12 +274,14 @@ def update_deburr(job):
     print("\nUpdate Deburr")
     print("-" * 30)
 
+    deburr = job["deburr"]
+
     job["deburr"] = {
-        "employee": input("Employee: ").strip(),
-        "deburr_needed": input("Deburr Needed: ").strip(),
-        "qty_deburred": get_int("Qty Deburred: "),
-        "status": input("Status: ").strip(),
-        "notes": input("Notes: ").strip(),
+        "employee": get_existing_or_new(deburr, "employee", "Employee"),
+        "deburr_needed": get_existing_or_new(deburr, "deburr_needed", "Deburr Needed"),
+        "qty_deburred": get_existing_int_or_new(deburr, "qty_deburred", "Qty Deburred"),
+        "status": get_existing_or_new(deburr, "status", "Status"),
+        "notes": get_existing_or_new(deburr, "notes", "Notes"),
     }
 
     save_job(job)
@@ -247,13 +291,15 @@ def update_inspection(job):
     print("\nUpdate Inspection")
     print("-" * 30)
 
+    inspection = job["inspection"]
+
     job["inspection"] = {
-        "inspector": input("Inspector: ").strip(),
-        "qty_checked": get_int("Qty Checked: "),
-        "qty_passed": get_int("Qty Passed: "),
-        "qty_failed": get_int("Qty Failed: "),
-        "status": input("Status: ").strip(),
-        "notes": input("Notes: ").strip(),
+        "inspector": get_existing_or_new(inspection, "inspector", "Inspector"),
+        "qty_checked": get_existing_int_or_new(inspection, "qty_checked", "Qty Checked"),
+        "qty_passed": get_existing_int_or_new(inspection, "qty_passed", "Qty Passed"),
+        "qty_failed": get_existing_int_or_new(inspection, "qty_failed", "Qty Failed"),
+        "status": get_existing_or_new(inspection, "status", "Status"),
+        "notes": get_existing_or_new(inspection, "notes", "Notes"),
     }
 
     save_job(job)
@@ -263,12 +309,14 @@ def update_packing(job):
     print("\nUpdate Packing")
     print("-" * 30)
 
+    packing = job["packing"]
+
     job["packing"] = {
-        "employee": input("Employee: ").strip(),
-        "qty_packed": get_int("Qty Packed: "),
-        "box_count": get_int("Box Count: "),
-        "status": input("Status: ").strip(),
-        "notes": input("Notes: ").strip(),
+        "employee": get_existing_or_new(packing, "employee", "Employee"),
+        "qty_packed": get_existing_int_or_new(packing, "qty_packed", "Qty Packed"),
+        "box_count": get_existing_int_or_new(packing, "box_count", "Box Count"),
+        "status": get_existing_or_new(packing, "status", "Status"),
+        "notes": get_existing_or_new(packing, "notes", "Notes"),
     }
 
     save_job(job)
@@ -278,13 +326,15 @@ def update_shipping(job):
     print("\nUpdate Shipping")
     print("-" * 30)
 
+    shipping = job["shipping"]
+
     job["shipping"] = {
-        "employee": input("Employee: ").strip(),
-        "ship_date": input("Ship Date: ").strip(),
-        "carrier": input("Carrier: ").strip(),
-        "tracking": input("Tracking: ").strip(),
-        "status": input("Status: ").strip(),
-        "notes": input("Notes: ").strip(),
+        "employee": get_existing_or_new(shipping, "employee", "Employee"),
+        "ship_date": get_existing_or_new(shipping, "ship_date", "Ship Date"),
+        "carrier": get_existing_or_new(shipping, "carrier", "Carrier"),
+        "tracking": get_existing_or_new(shipping, "tracking", "Tracking"),
+        "status": get_existing_or_new(shipping, "status", "Status"),
+        "notes": get_existing_or_new(shipping, "notes", "Notes"),
     }
 
     save_job(job)
