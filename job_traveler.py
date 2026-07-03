@@ -1,6 +1,7 @@
 # job_traveler.py
 import json
 import os
+from datetime import datetime
 
 
 BLANK = "__________"
@@ -24,6 +25,10 @@ def get_int(prompt):
             return int(raw)
         except ValueError:
             print("Invalid number. Enter a whole number.")
+
+
+def get_timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def has_existing_value(section_data, key):
@@ -153,6 +158,7 @@ def print_traveler(job):
     print(f"Revision:      {blank_if_missing(job, 'programming', 'revision')}")
     print(f"Machine:       {blank_if_missing(job, 'programming', 'machine')}")
     print(f"Status:        {blank_if_missing(job, 'programming', 'status')}")
+    print(f"Last Updated:  {blank_if_missing(job, 'programming', 'last_updated')}")
     print(f"Notes:         {blank_if_missing(job, 'programming', 'notes')}")
 
     print("\n" + "-" * 60)
@@ -163,6 +169,7 @@ def print_traveler(job):
     print(f"Cut Length:    {blank_if_missing(job, 'saw_cutting', 'cut_length')}")
     print(f"Scrap Qty:     {blank_if_missing(job, 'saw_cutting', 'scrap_qty')}")
     print(f"Status:        {blank_if_missing(job, 'saw_cutting', 'status')}")
+    print(f"Last Updated:  {blank_if_missing(job, 'saw_cutting', 'last_updated')}")
     print(f"Notes:         {blank_if_missing(job, 'saw_cutting', 'notes')}")
 
     print("\n" + "-" * 60)
@@ -174,6 +181,7 @@ def print_traveler(job):
     print(f"Qty Rejected:  {blank_if_missing(job, 'cnc_machining', 'qty_rejected')}")
     print(f"First Article: {blank_if_missing(job, 'cnc_machining', 'first_article')}")
     print(f"Status:        {blank_if_missing(job, 'cnc_machining', 'status')}")
+    print(f"Last Updated:  {blank_if_missing(job, 'cnc_machining', 'last_updated')}")
     print(f"Notes:         {blank_if_missing(job, 'cnc_machining', 'notes')}")
 
     print("\n" + "-" * 60)
@@ -183,6 +191,7 @@ def print_traveler(job):
     print(f"Deburr Needed: {blank_if_missing(job, 'deburr', 'deburr_needed')}")
     print(f"Qty Deburred:  {blank_if_missing(job, 'deburr', 'qty_deburred')}")
     print(f"Status:        {blank_if_missing(job, 'deburr', 'status')}")
+    print(f"Last Updated:  {blank_if_missing(job, 'deburr', 'last_updated')}")
     print(f"Notes:         {blank_if_missing(job, 'deburr', 'notes')}")
 
     print("\n" + "-" * 60)
@@ -193,6 +202,7 @@ def print_traveler(job):
     print(f"Qty Passed:    {blank_if_missing(job, 'inspection', 'qty_passed')}")
     print(f"Qty Failed:    {blank_if_missing(job, 'inspection', 'qty_failed')}")
     print(f"Status:        {blank_if_missing(job, 'inspection', 'status')}")
+    print(f"Last Updated:  {blank_if_missing(job, 'inspection', 'last_updated')}")
     print(f"Notes:         {blank_if_missing(job, 'inspection', 'notes')}")
 
     print("\n" + "-" * 60)
@@ -202,6 +212,7 @@ def print_traveler(job):
     print(f"Qty Packed:    {blank_if_missing(job, 'packing', 'qty_packed')}")
     print(f"Box Count:     {blank_if_missing(job, 'packing', 'box_count')}")
     print(f"Status:        {blank_if_missing(job, 'packing', 'status')}")
+    print(f"Last Updated:  {blank_if_missing(job, 'packing', 'last_updated')}")
     print(f"Notes:         {blank_if_missing(job, 'packing', 'notes')}")
 
     print("\n" + "-" * 60)
@@ -212,6 +223,7 @@ def print_traveler(job):
     print(f"Carrier:       {blank_if_missing(job, 'shipping', 'carrier')}")
     print(f"Tracking:      {blank_if_missing(job, 'shipping', 'tracking')}")
     print(f"Status:        {blank_if_missing(job, 'shipping', 'status')}")
+    print(f"Last Updated:  {blank_if_missing(job, 'shipping', 'last_updated')}")
     print(f"Notes:         {blank_if_missing(job, 'shipping', 'notes')}")
 
 
@@ -227,6 +239,7 @@ def update_programming(job):
         "revision": get_existing_or_new(programming, "revision", "Revision"),
         "machine": get_existing_or_new(programming, "machine", "Machine"),
         "status": get_existing_or_new(programming, "status", "Status"),
+        "last_updated": get_timestamp(),
         "notes": get_existing_or_new(programming, "notes", "Notes"),
     }
 
@@ -245,6 +258,7 @@ def update_saw_cutting(job):
         "cut_length": get_existing_or_new(saw_cutting, "cut_length", "Cut Length"),
         "scrap_qty": get_existing_int_or_new(saw_cutting, "scrap_qty", "Scrap Qty"),
         "status": get_existing_or_new(saw_cutting, "status", "Status"),
+        "last_updated": get_timestamp(),
         "notes": get_existing_or_new(saw_cutting, "notes", "Notes"),
     }
 
@@ -264,6 +278,7 @@ def update_cnc_machining(job):
         "qty_rejected": get_existing_int_or_new(cnc_machining, "qty_rejected", "Qty Rejected"),
         "first_article": get_existing_or_new(cnc_machining, "first_article", "First Article"),
         "status": get_existing_or_new(cnc_machining, "status", "Status"),
+        "last_updated": get_timestamp(),
         "notes": get_existing_or_new(cnc_machining, "notes", "Notes"),
     }
 
@@ -281,6 +296,7 @@ def update_deburr(job):
         "deburr_needed": get_existing_or_new(deburr, "deburr_needed", "Deburr Needed"),
         "qty_deburred": get_existing_int_or_new(deburr, "qty_deburred", "Qty Deburred"),
         "status": get_existing_or_new(deburr, "status", "Status"),
+        "last_updated": get_timestamp(),
         "notes": get_existing_or_new(deburr, "notes", "Notes"),
     }
 
@@ -299,6 +315,7 @@ def update_inspection(job):
         "qty_passed": get_existing_int_or_new(inspection, "qty_passed", "Qty Passed"),
         "qty_failed": get_existing_int_or_new(inspection, "qty_failed", "Qty Failed"),
         "status": get_existing_or_new(inspection, "status", "Status"),
+        "last_updated": get_timestamp(),
         "notes": get_existing_or_new(inspection, "notes", "Notes"),
     }
 
@@ -316,6 +333,7 @@ def update_packing(job):
         "qty_packed": get_existing_int_or_new(packing, "qty_packed", "Qty Packed"),
         "box_count": get_existing_int_or_new(packing, "box_count", "Box Count"),
         "status": get_existing_or_new(packing, "status", "Status"),
+        "last_updated": get_timestamp(),
         "notes": get_existing_or_new(packing, "notes", "Notes"),
     }
 
@@ -334,6 +352,7 @@ def update_shipping(job):
         "carrier": get_existing_or_new(shipping, "carrier", "Carrier"),
         "tracking": get_existing_or_new(shipping, "tracking", "Tracking"),
         "status": get_existing_or_new(shipping, "status", "Status"),
+        "last_updated": get_timestamp(),
         "notes": get_existing_or_new(shipping, "notes", "Notes"),
     }
 
