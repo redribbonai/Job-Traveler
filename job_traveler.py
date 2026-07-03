@@ -94,6 +94,42 @@ def load_job(job_number):
     return job
 
 
+def list_existing_jobs():
+    if not os.path.exists(JOBS_FOLDER):
+        print("\nNo saved job travelers found.")
+        return
+
+    job_files = [
+        filename
+        for filename in os.listdir(JOBS_FOLDER)
+        if filename.endswith(".json")
+    ]
+
+    if not job_files:
+        print("\nNo saved job travelers found.")
+        return
+
+    print("\nExisting Job Travelers")
+    print("-" * 30)
+    print("Job Number | Customer | Part Number | Qty To Make")
+
+    for filename in sorted(job_files):
+        path = os.path.join(JOBS_FOLDER, filename)
+
+        try:
+            with open(path, "r") as file:
+                job = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        print(
+            f"{job.get('job_number', BLANK)} | "
+            f"{job.get('customer', BLANK)} | "
+            f"{job.get('part_number', BLANK)} | "
+            f"Qty: {job.get('qty_to_make', BLANK)}"
+        )
+
+
 def create_new_job():
     print("\nCreate New Job Traveler")
     print("-" * 30)
@@ -438,6 +474,7 @@ def main():
         print("-" * 30)
         print("1. Create New Job Traveler")
         print("2. Open Existing Job Traveler")
+        print("3. List Existing Job Travelers")
         print("0. Exit")
 
         choice = input("Choose an option: ").strip()
@@ -451,6 +488,8 @@ def main():
 
             if job is not None:
                 job_menu(job)
+        elif choice == "3":
+            list_existing_jobs()
         elif choice == "0":
             print("Goodbye.")
             return
