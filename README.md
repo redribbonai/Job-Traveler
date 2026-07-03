@@ -22,6 +22,21 @@ This app creates digital job travelers for machine shop jobs. Each traveler is s
 - Add timestamps when sections are updated
 - Print a paper-style traveler with blanks for missing fields
 
+## Inspection
+
+The Inspection section is a First Article Inspection Report. It records:
+
+- Inspector
+- Operation: Mill or Turning
+- Machine
+- Target Dimension
+- Tolerance
+- Finding / Actual Dimension
+- Measurement Equipment Used
+- Pass / Rejected result
+
+Scrap, reject, and fail numbers are not printed on the public traveler. They may be used later for private boss reports.
+
 ## How to Run
 
 ```bash
