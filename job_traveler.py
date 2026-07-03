@@ -290,6 +290,24 @@ def update_shipping(job):
     save_job(job)
 
 
+def show_updated_traveler_and_choose_next(job):
+    print_traveler(job)
+
+    while True:
+        print("\nWhat next?")
+        print("1. Update another section")
+        print("0. Exit to Main Menu")
+
+        choice = input("Choose an option: ").strip()
+
+        if choice == "1":
+            return True
+        if choice == "0":
+            return False
+
+        print("Invalid choice. Please try again.")
+
+
 def job_menu(job):
     while True:
         print("\nJob Menu")
@@ -309,18 +327,32 @@ def job_menu(job):
 
         if choice == "1":
             update_programming(job)
+            if not show_updated_traveler_and_choose_next(job):
+                return
         elif choice == "2":
             update_saw_cutting(job)
+            if not show_updated_traveler_and_choose_next(job):
+                return
         elif choice == "3":
             update_cnc_machining(job)
+            if not show_updated_traveler_and_choose_next(job):
+                return
         elif choice == "4":
             update_deburr(job)
+            if not show_updated_traveler_and_choose_next(job):
+                return
         elif choice == "5":
             update_inspection(job)
+            if not show_updated_traveler_and_choose_next(job):
+                return
         elif choice == "6":
             update_packing(job)
+            if not show_updated_traveler_and_choose_next(job):
+                return
         elif choice == "7":
             update_shipping(job)
+            if not show_updated_traveler_and_choose_next(job):
+                return
         elif choice == "8":
             print_traveler(job)
         elif choice == "9":
