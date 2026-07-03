@@ -18,6 +18,15 @@ SECTIONS = [
 ]
 
 ALLOWED_STATUSES = ["Pending", "In Progress", "Completed"]
+ALLOWED_OPERATIONS = ["Mill", "Turning"]
+MILLING_MACHINES = [
+    "DNM 5700L",
+    "Mazak VC EZ26",
+]
+TURNING_MACHINES = [
+    "Lynx",
+    "Puma",
+]
 
 
 def get_int(prompt):
@@ -27,6 +36,18 @@ def get_int(prompt):
             return int(raw)
         except ValueError:
             print("Invalid number. Enter a whole number.")
+
+
+def get_yes_or_no(prompt):
+    while True:
+        choice = input(prompt).strip().lower()
+
+        if choice == "y":
+            return True
+        if choice == "n":
+            return False
+
+        print("Invalid choice. Please enter y or n.")
 
 
 def get_timestamp():
@@ -82,6 +103,91 @@ def get_status(section_data):
             return "Completed"
 
         print("Invalid choice. Please choose 1, 2, or 3.")
+
+
+def get_operation(section_data):
+    current_operation = section_data.get("operation")
+
+    while True:
+        print("\nOperation")
+
+        if has_existing_value(section_data, "operation"):
+            print(f"Current operation: {current_operation}")
+
+            if current_operation in ALLOWED_OPERATIONS:
+                print("Press Enter to keep the current operation.")
+            else:
+                print("Choose one of the allowed operations below.")
+
+        print("1. Mill")
+        print("2. Turning")
+
+        choice = input("Choose an operation: ").strip()
+
+        if choice == "" and current_operation in ALLOWED_OPERATIONS:
+            return current_operation
+
+        if choice == "1":
+            return "Mill"
+        if choice == "2":
+            return "Turning"
+
+        print("Invalid choice. Please choose 1 or 2.")
+
+
+def get_machine_for_operation(section_data, operation):
+    current_machine = section_data.get("machine")
+
+    if operation == "Mill":
+        machines = MILLING_MACHINES
+    else:
+        machines = TURNING_MACHINES
+
+    while True:
+        print("\nMachine")
+
+        if has_existing_value(section_data, "machine"):
+            print(f"Current machine: {current_machine}")
+
+            if current_machine in machines:
+                print("Press Enter to keep the current machine.")
+            else:
+                print("Choose one of the allowed machines below.")
+
+        for index, machine in enumerate(machines, start=1):
+            print(f"{index}. {machine}")
+
+        choice = input("Choose a machine: ").strip()
+
+        if choice == "" and current_machine in machines:
+            return current_machine
+
+        try:
+            choice_number = int(choice)
+        except ValueError:
+            print("Invalid choice. Please choose a number from the list.")
+            continue
+
+        if 1 <= choice_number <= len(machines):
+            return machines[choice_number - 1]
+
+        print("Invalid choice. Please choose a number from the list.")
+
+
+def get_dimension_result():
+    while True:
+        print("\nResult")
+        print("1. Pass")
+        print("2. Rejected")
+
+        choice = input("Choose a result: ").strip()
+
+        if choice == "1":
+            return "Pass"
+        if choice == "2":
+            return "Rejected"
+
+        print("Invalid choice. Please choose 1 or 2.")
 
 
 def get_existing_int_or_new(section_data, key, prompt):
@@ -208,6 +314,15 @@ def status_if_missing(job, section):
     return value
 
 
+def operation_if_missing(job, section):
+    value = job.get(section, {}).get("operation")
+
+    if value == "" or value is None or value not in ALLOWED_OPERATIONS:
+        return BLANK
+
+    return value
+
+
 def job_field(job, key):
     value = job.get(key)
 
@@ -276,11 +391,41 @@ def print_traveler(job):
     print("INSPECTION")
     print("-" * 60)
     print(f"Inspector:     {blank_if_missing(job, 'inspection', 'inspector')}")
-    print(f"Qty Checked:   {blank_if_missing(job, 'inspection', 'qty_checked')}")
-    print(f"Qty Passed:    {blank_if_missing(job, 'inspection', 'qty_passed')}")
+    print(f"Report Type:   {blank_if_missing(job, 'inspection', 'report_type')}")
+    print(f"Operation:     {operation_if_missing(job, 'inspection')}")
+    print(f"Machine:       {blank_if_missing(job, 'inspection', 'machine')}")
     print(f"Status:        {status_if_missing(job, 'inspection')}")
     print(f"Last Updated:  {blank_if_missing(job, 'inspection', 'last_updated')}")
     print(f"Notes:         {blank_if_missing(job, 'inspection', 'notes')}")
+
+    dimensions = job.get("inspection", {}).get("dimensions", [])
+
+    if not isinstance(dimensions, list):
+        dimensions = []
+
+    if dimensions:
+        print()
+        print("DIM | TARGET | TOLERANCE | FINDING | EQUIPMENT | RESULT")
+
+        for dimension in dimensions:
+            if not isinstance(dimension, dict):
+                dimension = {}
+
+            equipment = dimension.get(
+                "measurement_equipment_used",
+                dimension.get("tool_used", BLANK),
+            )
+
+            print(
+                f"{dimension.get('dimension_number', BLANK)} | "
+                f"{dimension.get('target_dimension', BLANK)} | "
+                f"{dimension.get('tolerance', BLANK)} | "
+                f"{dimension.get('finding', BLANK)} | "
+                f"{equipment} | "
+                f"{dimension.get('result', BLANK)}"
+            )
+    else:
+        print(f"Dimensions:    {BLANK}")
 
     print("\n" + "-" * 60)
     print("PACKING")
@@ -403,16 +548,60 @@ def update_inspection(job):
     print("-" * 30)
 
     inspection = job["inspection"]
+    dimensions = inspection.get("dimensions", [])
 
-    job["inspection"] = {
-        "inspector": get_existing_or_new(inspection, "inspector", "Inspector"),
-        "qty_checked": get_existing_int_or_new(inspection, "qty_checked", "Qty Checked"),
-        "qty_passed": get_existing_int_or_new(inspection, "qty_passed", "Qty Passed"),
-        "qty_failed": get_existing_int_or_new(inspection, "qty_failed", "Qty Failed"),
-        "status": get_status(inspection),
-        "last_updated": get_timestamp(),
-        "notes": get_existing_or_new(inspection, "notes", "Notes"),
-    }
+    if not isinstance(dimensions, list):
+        dimensions = []
+
+    inspection["inspector"] = get_existing_or_new(inspection, "inspector", "Inspector")
+    inspection["report_type"] = "First Article Inspection"
+    inspection["operation"] = get_operation(inspection)
+    inspection["machine"] = get_machine_for_operation(
+        inspection,
+        inspection["operation"],
+    )
+    inspection["status"] = get_status(inspection)
+
+    add_dimensions = False
+
+    if dimensions:
+        replace_dimensions = get_yes_or_no("Replace existing dimensions? (y/n): ")
+
+        if replace_dimensions:
+            dimensions = []
+            add_dimensions = True
+    else:
+        add_dimensions = get_yes_or_no("Add dimensions? (y/n): ")
+
+    if add_dimensions:
+        dimensions = []
+        dimension_number = 1
+
+        while True:
+            print(f"\nDimension {dimension_number}")
+            print("-" * 30)
+
+            dimensions.append(
+                {
+                    "dimension_number": dimension_number,
+                    "target_dimension": input("Target Dimension: ").strip(),
+                    "tolerance": input("Tolerance: ").strip(),
+                    "finding": input("Finding / Actual Dimension: ").strip(),
+                    "measurement_equipment_used": input(
+                        "Measurement Equipment Used: "
+                    ).strip(),
+                    "result": get_dimension_result(),
+                }
+            )
+
+            if not get_yes_or_no("Add another dimension? (y/n): "):
+                break
+
+            dimension_number += 1
+
+    inspection["dimensions"] = dimensions
+    inspection["notes"] = get_existing_or_new(inspection, "notes", "Notes")
+    inspection["last_updated"] = get_timestamp()
 
     save_job(job)
 
