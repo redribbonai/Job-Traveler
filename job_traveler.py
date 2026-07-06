@@ -20,13 +20,19 @@ SECTIONS = [
 ALLOWED_STATUSES = ["Pending", "In Progress", "Completed"]
 ALLOWED_OPERATIONS = ["Mill", "Turning"]
 MILLING_MACHINES = [
+    "Haas VF2 SS",
     "DNM 5700L",
-    "Mazak VC EZ26",
+    "DNM 4500",
+    "Mazak VC-EZ26",
 ]
 TURNING_MACHINES = [
-    "Lynx",
-    "Puma",
+    "Haas ST15Y",
+    "Lynx 2100LSY #1",
+    "Lynx 2100LSY #2",
+    "Puma 2600 SY2",
+    "Puma TT 1300 SYYB",
 ]
+ALL_MACHINES = MILLING_MACHINES + TURNING_MACHINES
 
 
 def get_int(prompt):
@@ -135,6 +141,61 @@ def get_operation(section_data):
         print("Invalid choice. Please choose 1 or 2.")
 
 
+def choose_machine(prompt):
+    while True:
+        print(f"\n{prompt}")
+
+        for index, machine in enumerate(ALL_MACHINES, start=1):
+            print(f"{index}. {machine}")
+
+        choice = input("Choose a machine: ").strip()
+
+        try:
+            choice_number = int(choice)
+        except ValueError:
+            print("Invalid choice. Please choose a number from the list.")
+            continue
+
+        if 1 <= choice_number <= len(ALL_MACHINES):
+            return ALL_MACHINES[choice_number - 1]
+
+        print("Invalid choice. Please choose a number from the list.")
+
+
+def get_existing_machine_or_new(section_data, prompt):
+    current_machine = section_data.get("machine")
+
+    while True:
+        print(f"\n{prompt}")
+
+        if has_existing_value(section_data, "machine"):
+            print(f"Current machine: {current_machine}")
+
+            if current_machine in ALL_MACHINES:
+                print("Press Enter to keep the current machine.")
+            else:
+                print("Choose one of the allowed machines below.")
+
+        for index, machine in enumerate(ALL_MACHINES, start=1):
+            print(f"{index}. {machine}")
+
+        choice = input("Choose a machine: ").strip()
+
+        if choice == "" and current_machine in ALL_MACHINES:
+            return current_machine
+
+        try:
+            choice_number = int(choice)
+        except ValueError:
+            print("Invalid choice. Please choose a number from the list.")
+            continue
+
+        if 1 <= choice_number <= len(ALL_MACHINES):
+            return ALL_MACHINES[choice_number - 1]
+
+        print("Invalid choice. Please choose a number from the list.")
+
+
 def get_machine_for_operation(section_data, operation):
     current_machine = section_data.get("machine")
 
@@ -206,6 +267,42 @@ def get_existing_int_or_new(section_data, key, prompt):
                 print("Invalid number. Enter a whole number.")
 
     return get_int(f"{prompt}: ")
+
+
+def get_required_quantity(job):
+    try:
+        return int(job.get("qty_to_make"))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_cnc_machine(job, cnc_machining):
+    programming = job.get("programming", {})
+
+    if has_existing_value(programming, "machine"):
+        return programming["machine"]
+
+    if has_existing_value(cnc_machining, "machine"):
+        return cnc_machining["machine"]
+
+    return choose_machine("Machine")
+
+
+def get_cnc_status(job, qty_completed, current_status):
+    required_quantity = get_required_quantity(job)
+
+    if qty_completed <= 0:
+        if current_status == "In Progress":
+            return "In Progress"
+        return "Pending"
+
+    if required_quantity is None:
+        return "In Progress"
+
+    if qty_completed >= required_quantity:
+        return "Completed"
+
+    return "In Progress"
 
 
 def save_job(job):
@@ -477,7 +574,7 @@ def update_programming(job):
         "programmer": get_existing_or_new(programming, "programmer", "Programmer"),
         "program_name": get_existing_or_new(programming, "program_name", "Program Name"),
         "revision": get_existing_or_new(programming, "revision", "Revision"),
-        "machine": get_existing_or_new(programming, "machine", "Machine"),
+        "machine": get_existing_machine_or_new(programming, "Machine"),
         "status": get_status(programming),
         "last_updated": get_timestamp(),
         "notes": get_existing_or_new(programming, "notes", "Notes"),
@@ -510,16 +607,28 @@ def update_cnc_machining(job):
     print("-" * 30)
 
     cnc_machining = job["cnc_machining"]
+    operator = get_existing_or_new(cnc_machining, "operator", "Operator Name")
+    qty_completed = get_existing_int_or_new(
+        cnc_machining,
+        "qty_completed",
+        "Quantity Pieces Completed",
+    )
+    machine = get_cnc_machine(job, cnc_machining)
+    status = get_cnc_status(
+        job,
+        qty_completed,
+        cnc_machining.get("status"),
+    )
 
     job["cnc_machining"] = {
-        "operator": get_existing_or_new(cnc_machining, "operator", "Operator"),
-        "machine": get_existing_or_new(cnc_machining, "machine", "Machine"),
-        "qty_completed": get_existing_int_or_new(cnc_machining, "qty_completed", "Qty Completed"),
-        "qty_rejected": get_existing_int_or_new(cnc_machining, "qty_rejected", "Qty Rejected"),
-        "first_article": get_existing_or_new(cnc_machining, "first_article", "First Article"),
-        "status": get_status(cnc_machining),
+        "operator": operator,
+        "machine": machine,
+        "qty_completed": qty_completed,
+        "qty_rejected": cnc_machining.get("qty_rejected", 0),
+        "first_article": cnc_machining.get("first_article", ""),
+        "status": status,
         "last_updated": get_timestamp(),
-        "notes": get_existing_or_new(cnc_machining, "notes", "Notes"),
+        "notes": cnc_machining.get("notes", ""),
     }
 
     save_job(job)
