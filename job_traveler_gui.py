@@ -118,7 +118,7 @@ def require_choice(value, field_name, allowed_values):
 
 
 def normalized_job(job):
-    """Return a deep copy with all legacy section dictionaries available."""
+    """Return a normalized deep copy with legacy jobs mapped to Operation 1."""
     if not isinstance(job, dict):
         raise ValidationError("The traveler file must contain a JSON object.")
 
@@ -130,7 +130,7 @@ def normalized_job(job):
             raise ValidationError(
                 f"Traveler section '{section}' must contain a JSON object."
             )
-    return normalized
+    return terminal_app.normalize_operations(normalized)
 
 
 def create_job_record(values):
@@ -165,7 +165,7 @@ def traveler_path(job_number, jobs_directory=None):
 
 def save_job_to_path(job, destination, jobs_directory=None, overwrite=True):
     """Atomically save a traveler to an existing in-scope JSON path."""
-    data = normalized_job(job)
+    data = terminal_app.canonical_job(normalized_job(job))
     directory = get_jobs_directory(jobs_directory)
     destination = Path(destination).resolve()
     if destination.parent != directory or destination.suffix.casefold() != ".json":
@@ -301,24 +301,65 @@ def machines_for_operation(operation):
 
 
 def apply_programming_update(job, values, timestamp=None):
-    """Validate and merge Programming data."""
-    operation = require_choice(
-        values.get("operation"), "Operation", terminal_app.ALLOWED_OPERATIONS
+    """Validate and replace a sequential Programming operation plan."""
+    operation_count = parse_positive_integer(
+        values.get("operation_count"), "Number of Operations Required"
     )
-    changes = {
-        "programmer": clean_text(values.get("programmer")),
-        "program_name": clean_text(values.get("program_name")),
-        "revision": clean_text(values.get("revision")),
-        "operation": operation,
-        "machine": require_choice(
-            values.get("machine"), "Machine", machines_for_operation(operation)
-        ),
-        "status": require_choice(
-            values.get("status"), "Status", terminal_app.ALLOWED_STATUSES
-        ),
-        "notes": clean_text(values.get("notes")),
-    }
-    return merge_section(job, "programming", changes, timestamp)
+    raw_operations = values.get("operations")
+    if not isinstance(raw_operations, list) or len(raw_operations) != operation_count:
+        raise ValidationError("Provide one Programming record for each operation.")
+    try:
+        candidate = terminal_app.resize_operation_plan(
+            job, operation_count, bool(values.get("confirm_removal"))
+        )
+    except ValueError as error:
+        raise ValidationError(str(error))
+    updated_operations = []
+    updated_at = timestamp or terminal_app.get_timestamp()
+    for number, raw in enumerate(raw_operations, start=1):
+        if not isinstance(raw, dict):
+            raise ValidationError(f"Operation {number} must be a record.")
+        existing = candidate["programming"]["operations"][number - 1]
+        operation = copy.deepcopy(existing)
+        operation.update(
+            {
+                "operation_number": number,
+                "operation_type": require_choice(
+                    raw.get("operation_type"),
+                    f"Operation {number} Type",
+                    terminal_app.ALLOWED_OPERATIONS,
+                ),
+                "program_name": clean_text(raw.get("program_name")),
+                "revision": clean_text(raw.get("revision")),
+                "status": require_choice(
+                    raw.get("status"),
+                    f"Operation {number} Status",
+                    terminal_app.ALLOWED_STATUSES,
+                ),
+                "last_updated": updated_at,
+                "notes": clean_text(raw.get("notes")),
+            }
+        )
+        operation.pop("machine", None)
+        operation.pop("operation", None)
+        updated_operations.append(operation)
+    programming = candidate["programming"]
+    programming["programmer"] = clean_text(values.get("programmer"))
+    programming["operation_count"] = operation_count
+    programming["operations"] = updated_operations
+    for key in (
+        "program_name",
+        "revision",
+        "operation",
+        "machine",
+        "status",
+        "last_updated",
+        "notes",
+    ):
+        programming.pop(key, None)
+    job.clear()
+    job.update(candidate)
+    return programming
 
 
 STANDARD_SECTION_RULES = {
@@ -355,74 +396,125 @@ def apply_standard_section_update(job, section_name, values, timestamp=None):
     return merge_section(job, section_name, changes, timestamp)
 
 
-def resolve_cnc_machine(job, requested_machine=None):
-    """Apply the terminal workflow's programming-first machine priority."""
-    programming = job.get("programming", {})
-    if isinstance(programming, dict) and terminal_app.has_existing_value(
-        programming, "machine"
-    ):
-        return programming["machine"]
-
-    cnc = job.get("cnc_machining", {})
-    if isinstance(cnc, dict) and terminal_app.has_existing_value(cnc, "machine"):
-        return cnc["machine"]
-
-    return require_choice(requested_machine, "Machine", terminal_app.ALL_MACHINES)
+def resolve_cnc_machine(job, operation_number=1):
+    """Return a selected operation's saved CNC machine, including legacy fallback."""
+    normalized = normalized_job(job)
+    operation = terminal_app.operation_by_number(
+        normalized["cnc_machining"]["operations"], operation_number
+    )
+    return operation.get("machine", "") if operation else ""
 
 
 def apply_cnc_update(job, values, timestamp=None):
-    """Merge the polished CNC fields and derive status from completed quantity."""
-    qty_completed = parse_nonnegative_integer(
-        values.get("qty_completed"), "Quantity Pieces Completed"
+    """Update one CNC operation and derive its status from completed quantity."""
+    candidate = normalized_job(job)
+    operation_number = parse_positive_integer(values.get("operation_number"), "Operation")
+    programming_operation = terminal_app.operation_by_number(
+        candidate["programming"]["operations"], operation_number
     )
-    current = job.get("cnc_machining", {})
-    if not isinstance(current, dict):
-        current = {}
-    machine = resolve_cnc_machine(job, values.get("machine"))
-    changes = {
-        "operator": clean_text(values.get("operator")),
-        "machine": machine,
-        "qty_completed": qty_completed,
-        "status": terminal_app.get_cnc_status(
-            job, qty_completed, current.get("status")
-        ),
-    }
-    updated = merge_section(job, "cnc_machining", changes, timestamp)
-    updated.setdefault("qty_rejected", 0)
-    updated.setdefault("first_article", "")
-    updated.setdefault("notes", "")
+    if programming_operation is None:
+        raise ValidationError("Select a configured operation.")
+    operation_type = require_choice(
+        programming_operation.get("operation_type"),
+        "Operation Type",
+        terminal_app.ALLOWED_OPERATIONS,
+    )
+    machine = require_choice(
+        values.get("machine"), "Machine", machines_for_operation(operation_type)
+    )
+    qty_complete = parse_nonnegative_integer(
+        values.get("qty_complete", values.get("qty_completed")),
+        "Quantity Pieces Completed",
+    )
+    updated = terminal_app.operation_by_number(
+        candidate["cnc_machining"]["operations"], operation_number
+    )
+    updated.update(
+        {
+            "operation_number": operation_number,
+            "operator": clean_text(values.get("operator")),
+            "machine": machine,
+            "qty_complete": qty_complete,
+            "status": terminal_app.get_cnc_status(
+                candidate, qty_complete, updated.get("status")
+            ),
+            "last_updated": timestamp or terminal_app.get_timestamp(),
+            "notes": clean_text(values.get("notes")),
+        }
+    )
+    updated.pop("qty_completed", None)
+    updated.pop("first_article", None)
+    cnc = candidate["cnc_machining"]
+    for key in (
+        "operator",
+        "machine",
+        "qty_completed",
+        "qty_complete",
+        "status",
+        "last_updated",
+        "notes",
+        "first_article",
+    ):
+        cnc.pop(key, None)
+    job.clear()
+    job.update(candidate)
     return updated
 
 
 def apply_inspection_update(job, values, timestamp=None):
-    """Merge First Article header fields while preserving dimensions."""
-    existing = job.get("inspection", {})
-    if isinstance(existing, dict) and "dimensions" in existing and not isinstance(
-        existing["dimensions"], list
-    ):
+    """Update one inspection record using Programming/CNC-derived snapshots."""
+    candidate = normalized_job(job)
+    operation_number = parse_positive_integer(values.get("operation_number"), "Operation")
+    programming_operation = terminal_app.operation_by_number(
+        candidate["programming"]["operations"], operation_number
+    )
+    cnc_operation = terminal_app.operation_by_number(
+        candidate["cnc_machining"]["operations"], operation_number
+    )
+    if programming_operation is None:
+        raise ValidationError("Select a configured operation.")
+    machine = cnc_operation.get("machine", "") if cnc_operation else ""
+    if not machine:
+        raise ValidationError(
+            "No CNC machine is assigned to this operation. "
+            "Assign the machine in CNC Machining first."
+        )
+    inspection = candidate["inspection"]
+    record = terminal_app.operation_by_number(inspection["records"], operation_number)
+    if record is None:
+        record = {"operation_number": operation_number, "dimensions": []}
+        inspection["records"].append(record)
+    if not isinstance(record.get("dimensions", []), list):
         raise ValidationError(
             "Saved inspection dimensions are not a list. The traveler was not changed."
         )
-    operation = require_choice(
-        values.get("operation"), "Operation", terminal_app.ALLOWED_OPERATIONS
+    record.update(
+        {
+            "operation_type": programming_operation.get("operation_type", ""),
+            "machine": machine,
+            "inspector": clean_text(values.get("inspector")),
+            "report_type": clean_text(values.get("report_type")) or "First Article Inspection",
+            "status": require_choice(
+                values.get("status"), "Status", terminal_app.ALLOWED_STATUSES
+            ),
+            "last_updated": timestamp or terminal_app.get_timestamp(),
+            "notes": clean_text(values.get("notes")),
+        }
     )
-    machine = require_choice(
-        values.get("machine"), "Machine", machines_for_operation(operation)
-    )
-    changes = {
-        "inspector": clean_text(values.get("inspector")),
-        "report_type": "First Article Inspection",
-        "operation": operation,
-        "machine": machine,
-        "status": require_choice(
-            values.get("status"), "Status", terminal_app.ALLOWED_STATUSES
-        ),
-        "notes": clean_text(values.get("notes")),
-    }
-    inspection = merge_section(job, "inspection", changes, timestamp)
-    if not isinstance(inspection.get("dimensions"), list):
-        inspection["dimensions"] = []
-    return inspection
+    for key in (
+        "inspector",
+        "report_type",
+        "operation",
+        "machine",
+        "status",
+        "dimensions",
+        "notes",
+        "last_updated",
+    ):
+        inspection.pop(key, None)
+    job.clear()
+    job.update(candidate)
+    return record
 
 
 def next_dimension_number(dimensions):
@@ -457,24 +549,21 @@ def build_dimension(values, dimension_number):
     return dimension
 
 
-def apply_dimensions_update(job, dimensions, timestamp=None):
-    """Persist the existing First Article list under the inspection section."""
+def apply_dimensions_update(job, dimensions, operation_number=1, timestamp=None):
+    """Persist dimensions under one operation-linked inspection record."""
     if not isinstance(dimensions, list):
         raise ValidationError("Inspection dimensions must be a list.")
-    if "inspection" not in job:
-        inspection = {}
-    else:
-        inspection = job["inspection"]
-        if not isinstance(inspection, dict):
-            raise ValidationError(
-                "Traveler section 'inspection' must contain a JSON object."
-            )
-    updated = copy.deepcopy(inspection)
-    updated["report_type"] = "First Article Inspection"
-    updated["dimensions"] = copy.deepcopy(dimensions)
-    updated["last_updated"] = timestamp or terminal_app.get_timestamp()
-    job["inspection"] = updated
-    return updated
+    candidate = normalized_job(job)
+    record = terminal_app.operation_by_number(
+        candidate["inspection"]["records"], operation_number
+    )
+    if record is None:
+        raise ValidationError("Save the Inspection header before adding dimensions.")
+    record["dimensions"] = copy.deepcopy(dimensions)
+    record["last_updated"] = timestamp or terminal_app.get_timestamp()
+    job.clear()
+    job.update(candidate)
+    return record
 
 
 def traveler_text(job):
@@ -837,7 +926,11 @@ class JobTravelerApp:
         )
         for index, (label, key) in enumerate(header_items):
             row, column = divmod(index, 2)
-            value = current_job_status(self.current_job) if key is None else self.current_job.get(key, "")
+            value = (
+                current_job_status(self.current_job)
+                if key is None
+                else self.current_job.get(key, "")
+            )
             cell = ttk.Frame(header)
             cell.grid(row=row, column=column, sticky="ew", padx=8, pady=6)
             ttk.Label(cell, text=f"{label}:", style="Field.TLabel").pack(side="left")
@@ -857,7 +950,6 @@ class JobTravelerApp:
             ("Inspection", self.show_inspection),
             ("Packing", lambda: self.show_standard_section("packing")),
             ("Shipping", lambda: self.show_standard_section("shipping")),
-            ("First Article Inspection", self.show_first_article),
             ("Print / View Traveler", self.show_traveler_preview),
         )
         for index, (label, command) in enumerate(actions):
@@ -987,99 +1079,136 @@ class JobTravelerApp:
         self.page_header(
             content,
             "Programming",
-            "Select the operation first, then choose an official machine for it.",
+            "Define the machining plan. Machines are assigned later in CNC Machining.",
         )
-        programming = self.current_job.get("programming", {})
-        if not isinstance(programming, dict):
-            programming = {}
+        normalized = normalized_job(self.current_job)
+        programming = normalized["programming"]
         form = ttk.LabelFrame(content, text="Programming", padding=20)
         form.pack(fill="x")
-
-        entries = {}
-        for row, (key, label) in enumerate(
-            (
-                ("programmer", "Programmer Name"),
-                ("program_name", "Program Name"),
-                ("revision", "Revision"),
-            )
-        ):
-            ttk.Label(form, text=f"{label}:", style="Field.TLabel").grid(
-                row=row, column=0, sticky="w", padx=(0, 16), pady=7
-            )
-            entry = ttk.Entry(form, width=62)
-            entry.insert(0, str(programming.get(key, "")))
-            entry.grid(row=row, column=1, sticky="ew", pady=7)
-            entries[key] = entry
-
-        ttk.Label(form, text="Operation:", style="Field.TLabel").grid(
-            row=3, column=0, sticky="w", padx=(0, 16), pady=7
+        ttk.Label(form, text="Programmer Name:", style="Field.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 16), pady=7
         )
-        operation = ttk.Combobox(
-            form,
-            values=terminal_app.ALLOWED_OPERATIONS,
-            state="readonly",
-            width=58,
+        programmer = ttk.Entry(form, width=62)
+        programmer.insert(0, str(programming.get("programmer", "")))
+        programmer.grid(row=0, column=1, sticky="ew", pady=7)
+        ttk.Label(form, text="Number of Operations:", style="Field.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 16), pady=7
         )
-        saved_machine = programming.get("machine", "")
-        saved_operation = programming.get("operation", "")
-        if clean_text(saved_operation) == "":
-            saved_operation = operation_for_machine(saved_machine)
-        operation.set(saved_operation)
-        operation.grid(row=3, column=1, sticky="ew", pady=7)
-
-        ttk.Label(form, text="Official Machine:", style="Field.TLabel").grid(
-            row=4, column=0, sticky="w", padx=(0, 16), pady=7
-        )
-        machine = ttk.Combobox(form, state="readonly", width=58)
-        machine.set(saved_machine)
-        machine.grid(row=4, column=1, sticky="ew", pady=7)
-
-        def refresh_machines(event=None):
-            selected_operation = operation.get()
-            if selected_operation not in terminal_app.ALLOWED_OPERATIONS:
-                machine.configure(values=())
-                return
-            choices = machines_for_operation(selected_operation)
-            machine.configure(values=choices)
-            if event is not None and machine.get() not in choices:
-                machine.set("")
-
-        operation.bind("<<ComboboxSelected>>", refresh_machines)
-        refresh_machines()
-
-        ttk.Label(form, text="Status:", style="Field.TLabel").grid(
-            row=5, column=0, sticky="w", padx=(0, 16), pady=7
-        )
-        status = ttk.Combobox(
-            form,
-            values=terminal_app.ALLOWED_STATUSES,
-            state="readonly",
-            width=58,
-        )
-        status.set(programming.get("status", ""))
-        status.grid(row=5, column=1, sticky="ew", pady=7)
-
-        ttk.Label(form, text="Notes:", style="Field.TLabel").grid(
-            row=6, column=0, sticky="nw", padx=(0, 16), pady=7
-        )
-        notes = tk.Text(form, height=5, width=62, wrap="word", font=("Segoe UI", 10))
-        notes.insert("1.0", str(programming.get("notes", "")))
-        notes.grid(row=6, column=1, sticky="ew", pady=7)
+        count = ttk.Entry(form, width=16)
+        count.insert(0, str(programming["operation_count"]))
+        count.grid(row=1, column=1, sticky="w", pady=7)
         form.columnconfigure(1, weight=1)
+
+        operations_frame = ttk.Frame(content, style="App.TFrame")
+        operations_frame.pack(fill="x", pady=(16, 0))
+        operation_widgets = []
+
+        def collect_operations():
+            rows = []
+            for widgets in operation_widgets:
+                rows.append(
+                    {
+                        "operation_type": widgets["operation_type"].get(),
+                        "program_name": widgets["program_name"].get(),
+                        "revision": widgets["revision"].get(),
+                        "status": widgets["status"].get(),
+                        "notes": widgets["notes"].get("1.0", "end-1c"),
+                    }
+                )
+            return rows
+
+        def render_operations(desired_count, seed_rows=None):
+            for child in operations_frame.winfo_children():
+                child.destroy()
+            operation_widgets.clear()
+            seed_rows = seed_rows or programming["operations"]
+            for index in range(desired_count):
+                saved = seed_rows[index] if index < len(seed_rows) else {}
+                card = ttk.LabelFrame(
+                    operations_frame, text=f"Operation {index + 1}", padding=16
+                )
+                card.pack(fill="x", pady=(0, 12))
+                widgets = {}
+                specs = (
+                    ("operation_type", "Operation Type", "combo", terminal_app.ALLOWED_OPERATIONS),
+                    ("program_name", "Program Name", "entry", ()),
+                    ("revision", "Revision", "entry", ()),
+                    ("status", "Status", "combo", terminal_app.ALLOWED_STATUSES),
+                    ("notes", "Notes", "notes", ()),
+                )
+                for row, (key, label, kind, choices) in enumerate(specs):
+                    ttk.Label(card, text=f"{label}:", style="Field.TLabel").grid(
+                        row=row, column=0, sticky="nw", padx=(0, 16), pady=5
+                    )
+                    if kind == "combo":
+                        widget = ttk.Combobox(card, values=choices, state="readonly", width=55)
+                        widget.set(str(saved.get(key, "")))
+                    elif kind == "notes":
+                        widget = tk.Text(
+                            card,
+                            height=3,
+                            width=59,
+                            wrap="word",
+                            font=("Segoe UI", 10),
+                        )
+                        widget.insert("1.0", str(saved.get(key, "")))
+                    else:
+                        widget = ttk.Entry(card, width=59)
+                        widget.insert(0, str(saved.get(key, "")))
+                    widget.grid(row=row, column=1, sticky="ew", pady=5)
+                    widgets[key] = widget
+                card.columnconfigure(1, weight=1)
+                operation_widgets.append(widgets)
+
+        def refresh_editor():
+            try:
+                desired_count = parse_positive_integer(
+                    count.get(), "Number of Operations Required"
+                )
+            except ValidationError as error:
+                messagebox.showerror("Invalid Programming", str(error), parent=self.root)
+                return
+            render_operations(desired_count, collect_operations())
+
+        ttk.Button(form, text="Update Operation Editor", command=refresh_editor).grid(
+            row=1, column=1, sticky="e", pady=7
+        )
+        render_operations(programming["operation_count"])
 
         def save_section():
             candidate = copy.deepcopy(self.current_job)
             try:
+                desired_count = parse_positive_integer(
+                    count.get(), "Number of Operations Required"
+                )
+            except ValidationError as error:
+                messagebox.showerror("Invalid Programming", str(error), parent=self.root)
+                return
+            if desired_count != len(operation_widgets):
+                messagebox.showerror(
+                    "Invalid Programming",
+                    "Update the operation editor after changing the operation count.",
+                    parent=self.root,
+                )
+                return
+            confirm_removal = False
+            if desired_count < programming["operation_count"]:
+                confirm_removal = messagebox.askyesno(
+                    "Reduce Operations",
+                    "Remove the unused operation(s)? Production and inspection "
+                    "data will never be deleted.",
+                    parent=self.root,
+                )
+                if not confirm_removal:
+                    return
+            try:
                 apply_programming_update(
                     candidate,
                     {
-                        "programmer": entries["programmer"].get(),
-                        "program_name": entries["program_name"].get(),
-                        "revision": entries["revision"].get(),
-                        "operation": operation.get(),
-                        "machine": machine.get(),
-                        "status": status.get(),
-                        "notes": notes.get("1.0", "end-1c"),
+                        "programmer": programmer.get(),
+                        "operation_count": str(desired_count),
+                        "operations": collect_operations(),
+                        "confirm_removal": confirm_removal,
                     },
                 )
             except ValidationError as error:
@@ -1157,64 +1286,105 @@ class JobTravelerApp:
 
     def show_cnc_machining(self):
         self.clear_screen()
-        frame = ttk.Frame(self.root, style="App.TFrame", padding=28)
-        frame.pack(fill="both", expand=True)
+        scroll = ScrollableFrame(self.root)
+        scroll.pack(fill="both", expand=True)
+        frame = scroll.content
         self.page_header(
             frame,
             "CNC Machining",
             "Status is calculated automatically from completed and required quantities.",
         )
-        cnc = self.current_job.get("cnc_machining", {})
-        if not isinstance(cnc, dict):
-            cnc = {}
-        programming = self.current_job.get("programming", {})
-        inherited_machine = ""
-        if isinstance(programming, dict) and terminal_app.has_existing_value(
-            programming, "machine"
-        ):
-            inherited_machine = programming["machine"]
+        normalized = normalized_job(self.current_job)
+        programming_operations = normalized["programming"]["operations"]
+        cnc_operations = normalized["cnc_machining"]["operations"]
 
         form = ttk.LabelFrame(frame, text="CNC Workflow", padding=20)
         form.pack(fill="x")
-        ttk.Label(form, text="Operator Name:", style="Field.TLabel").grid(
+        ttk.Label(form, text="Operation:", style="Field.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 16), pady=8
         )
-        operator = ttk.Entry(form, width=60)
-        operator.insert(0, str(cnc.get("operator", "")))
-        operator.grid(row=0, column=1, sticky="ew", pady=8)
-
-        ttk.Label(form, text="Machine:", style="Field.TLabel").grid(
+        operation = ttk.Combobox(
+            form,
+            values=[
+                f"Operation {row['operation_number']} - "
+                f"{row.get('operation_type') or terminal_app.BLANK}"
+                for row in programming_operations
+            ],
+            state="readonly",
+            width=58,
+        )
+        operation.grid(row=0, column=1, sticky="ew", pady=8)
+        ttk.Label(form, text="Operation Type:", style="Field.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 16), pady=8
         )
-        machine = ttk.Combobox(form, values=terminal_app.ALL_MACHINES, width=58)
-        existing_machine = inherited_machine or cnc.get("machine", "")
-        if existing_machine:
-            machine.set(existing_machine)
-        if inherited_machine:
-            machine.configure(state="disabled")
-        else:
-            machine.configure(state="readonly")
-        machine.grid(row=1, column=1, sticky="ew", pady=8)
-        if inherited_machine:
-            ttk.Label(
-                form,
-                text="Inherited from Programming",
-                foreground="#44596d",
-            ).grid(row=2, column=1, sticky="w", pady=(0, 6))
+        operation_type_value = ttk.Label(form, text="", style="Value.TLabel")
+        operation_type_value.grid(row=1, column=1, sticky="w", pady=8)
+        ttk.Label(form, text="Operator Name:", style="Field.TLabel").grid(
+            row=2, column=0, sticky="w", padx=(0, 16), pady=8
+        )
+        operator = ttk.Entry(form, width=60)
+        operator.grid(row=2, column=1, sticky="ew", pady=8)
+
+        ttk.Label(form, text="Machine:", style="Field.TLabel").grid(
+            row=3, column=0, sticky="w", padx=(0, 16), pady=8
+        )
+        machine = ttk.Combobox(form, state="readonly", width=58)
+        machine.grid(row=3, column=1, sticky="ew", pady=8)
 
         ttk.Label(
             form, text="Quantity Pieces Completed:", style="Field.TLabel"
-        ).grid(row=3, column=0, sticky="w", padx=(0, 16), pady=8)
+        ).grid(row=4, column=0, sticky="w", padx=(0, 16), pady=8)
         quantity = ttk.Entry(form, width=60)
-        quantity.insert(0, str(cnc.get("qty_completed", "")))
-        quantity.grid(row=3, column=1, sticky="ew", pady=8)
+        quantity.grid(row=4, column=1, sticky="ew", pady=8)
         ttk.Label(form, text="Required Quantity:", style="Field.TLabel").grid(
-            row=4, column=0, sticky="w", padx=(0, 16), pady=8
+            row=5, column=0, sticky="w", padx=(0, 16), pady=8
         )
         ttk.Label(
             form, text=str(self.current_job.get("qty_to_make", "")), style="Value.TLabel"
-        ).grid(row=4, column=1, sticky="w", pady=8)
+        ).grid(row=5, column=1, sticky="w", pady=8)
+        ttk.Label(form, text="Current Status:", style="Field.TLabel").grid(
+            row=6, column=0, sticky="w", padx=(0, 16), pady=8
+        )
+        status_value = ttk.Label(form, text="Pending", style="Status.TLabel")
+        status_value.grid(row=6, column=1, sticky="w", pady=8)
+        ttk.Label(form, text="Notes:", style="Field.TLabel").grid(
+            row=7, column=0, sticky="nw", padx=(0, 16), pady=8
+        )
+        notes = tk.Text(form, height=4, width=60, wrap="word", font=("Segoe UI", 10))
+        notes.grid(row=7, column=1, sticky="ew", pady=8)
         form.columnconfigure(1, weight=1)
+
+        def selected_number():
+            index = operation.current()
+            return programming_operations[index]["operation_number"] if index >= 0 else None
+
+        def refresh_operation(_event=None):
+            number = selected_number()
+            if number is None:
+                return
+            plan = terminal_app.operation_by_number(programming_operations, number)
+            saved = terminal_app.operation_by_number(cnc_operations, number)
+            operation_type = plan.get("operation_type", "")
+            operation_type_value.configure(text=operation_type)
+            choices = (
+                machines_for_operation(operation_type)
+                if operation_type in terminal_app.ALLOWED_OPERATIONS
+                else ()
+            )
+            machine.configure(values=choices)
+            machine.set(saved.get("machine", ""))
+            operator.delete(0, "end")
+            operator.insert(0, str(saved.get("operator", "")))
+            quantity.delete(0, "end")
+            quantity.insert(0, str(saved.get("qty_complete", 0)))
+            status_value.configure(text=saved.get("status", "Pending"))
+            notes.delete("1.0", "end")
+            notes.insert("1.0", str(saved.get("notes", "")))
+
+        operation.bind("<<ComboboxSelected>>", refresh_operation)
+        if programming_operations:
+            operation.current(0)
+            refresh_operation()
 
         def save_section():
             candidate = copy.deepcopy(self.current_job)
@@ -1224,7 +1394,9 @@ class JobTravelerApp:
                     {
                         "operator": operator.get(),
                         "machine": machine.get(),
-                        "qty_completed": quantity.get(),
+                        "qty_complete": quantity.get(),
+                        "operation_number": selected_number(),
+                        "notes": notes.get("1.0", "end-1c"),
                     },
                 )
             except ValidationError as error:
@@ -1256,83 +1428,106 @@ class JobTravelerApp:
         self.page_header(
             content,
             "Inspection",
-            "First Article header values and operation-specific machine selection.",
+            "Select an operation; its type and CNC machine are filled automatically.",
         )
-        inspection = self.current_job.get("inspection", {})
-        if not isinstance(inspection, dict):
-            inspection = {}
+        normalized = normalized_job(self.current_job)
+        programming_operations = normalized["programming"]["operations"]
+        cnc_operations = normalized["cnc_machining"]["operations"]
+        inspection_records = normalized["inspection"]["records"]
         form = ttk.LabelFrame(content, text="Inspection Header", padding=20)
         form.pack(fill="x")
 
-        ttk.Label(form, text="Inspector:", style="Field.TLabel").grid(
+        ttk.Label(form, text="Operation:", style="Field.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 16), pady=7
         )
-        inspector = ttk.Entry(form, width=60)
-        inspector.insert(0, str(inspection.get("inspector", "")))
-        inspector.grid(row=0, column=1, sticky="ew", pady=7)
-
-        ttk.Label(form, text="Report Type:", style="Field.TLabel").grid(
+        operation = ttk.Combobox(
+            form,
+            values=[
+                f"Operation {row['operation_number']} - "
+                f"{row.get('operation_type') or terminal_app.BLANK}"
+                for row in programming_operations
+            ],
+            state="readonly",
+            width=58,
+        )
+        operation.grid(row=0, column=1, sticky="ew", pady=7)
+        ttk.Label(form, text="Operation Type:", style="Field.TLabel").grid(
             row=1, column=0, sticky="w", padx=(0, 16), pady=7
         )
-        ttk.Label(
-            form, text="First Article Inspection", style="Value.TLabel"
-        ).grid(row=1, column=1, sticky="w", pady=7)
-
-        ttk.Label(form, text="Operation:", style="Field.TLabel").grid(
+        operation_type_value = ttk.Label(form, text="", style="Value.TLabel")
+        operation_type_value.grid(row=1, column=1, sticky="w", pady=7)
+        ttk.Label(form, text="Machine:", style="Field.TLabel").grid(
             row=2, column=0, sticky="w", padx=(0, 16), pady=7
         )
-        operation = ttk.Combobox(
-            form, values=terminal_app.ALLOWED_OPERATIONS, state="readonly", width=58
-        )
-        saved_machine = inspection.get("machine", "")
-        saved_operation = inspection.get("operation", "")
-        if clean_text(saved_operation) == "":
-            saved_operation = operation_for_machine(saved_machine)
-        operation.set(saved_operation)
-        operation.grid(row=2, column=1, sticky="ew", pady=7)
-
-        ttk.Label(form, text="Machine:", style="Field.TLabel").grid(
-            row=3, column=0, sticky="w", padx=(0, 16), pady=7
-        )
-        machine = ttk.Combobox(form, state="readonly", width=58)
-        machine.set(saved_machine)
-        machine.grid(row=3, column=1, sticky="ew", pady=7)
-
-        def refresh_machines(event=None):
-            selected_operation = operation.get()
-            if selected_operation not in terminal_app.ALLOWED_OPERATIONS:
-                machine.configure(values=())
-                return
-            choices = machines_for_operation(selected_operation)
-            machine.configure(values=choices)
-            if event is not None and machine.get() not in choices:
-                machine.set("")
-
-        operation.bind("<<ComboboxSelected>>", refresh_machines)
-        refresh_machines()
-
-        ttk.Label(form, text="Status:", style="Field.TLabel").grid(
+        machine_value = ttk.Label(form, text="", style="Value.TLabel")
+        machine_value.grid(row=2, column=1, sticky="w", pady=7)
+        warning_value = ttk.Label(form, text="", foreground="#a33a2b")
+        warning_value.grid(row=3, column=1, sticky="w", pady=(0, 7))
+        ttk.Label(form, text="Inspector:", style="Field.TLabel").grid(
             row=4, column=0, sticky="w", padx=(0, 16), pady=7
+        )
+        inspector = ttk.Entry(form, width=60)
+        inspector.grid(row=4, column=1, sticky="ew", pady=7)
+        ttk.Label(form, text="Report Type:", style="Field.TLabel").grid(
+            row=5, column=0, sticky="w", padx=(0, 16), pady=7
+        )
+        report_type_value = ttk.Label(form, text="First Article Inspection", style="Value.TLabel")
+        report_type_value.grid(row=5, column=1, sticky="w", pady=7)
+        ttk.Label(form, text="Status:", style="Field.TLabel").grid(
+            row=6, column=0, sticky="w", padx=(0, 16), pady=7
         )
         status = ttk.Combobox(
             form, values=terminal_app.ALLOWED_STATUSES, state="readonly", width=58
         )
-        status.set(inspection.get("status", ""))
-        status.grid(row=4, column=1, sticky="ew", pady=7)
-
+        status.grid(row=6, column=1, sticky="ew", pady=7)
         ttk.Label(form, text="Notes:", style="Field.TLabel").grid(
-            row=5, column=0, sticky="nw", padx=(0, 16), pady=7
+            row=7, column=0, sticky="nw", padx=(0, 16), pady=7
         )
         notes = tk.Text(form, height=6, width=60, wrap="word", font=("Segoe UI", 10))
-        notes.insert("1.0", str(inspection.get("notes", "")))
-        notes.grid(row=5, column=1, sticky="ew", pady=7)
+        notes.grid(row=7, column=1, sticky="ew", pady=7)
         form.columnconfigure(1, weight=1)
+
+        def selected_number():
+            index = operation.current()
+            return programming_operations[index]["operation_number"] if index >= 0 else None
+
+        def refresh_operation(_event=None):
+            number = selected_number()
+            if number is None:
+                return
+            plan = terminal_app.operation_by_number(programming_operations, number)
+            cnc = terminal_app.operation_by_number(cnc_operations, number)
+            record = terminal_app.operation_by_number(inspection_records, number) or {}
+            operation_type_value.configure(text=plan.get("operation_type", ""))
+            machine = cnc.get("machine", "") if cnc else ""
+            machine_value.configure(text=machine or "Not assigned")
+            warning_value.configure(
+                text=(
+                    ""
+                    if machine
+                    else "Assign the machine in CNC Machining before inspecting "
+                    "this operation."
+                )
+            )
+            inspector.delete(0, "end")
+            inspector.insert(0, str(record.get("inspector", "")))
+            report_type_value.configure(
+                text=record.get("report_type") or "First Article Inspection"
+            )
+            status.set(str(record.get("status", "Pending")))
+            notes.delete("1.0", "end")
+            notes.insert("1.0", str(record.get("notes", "")))
+
+        operation.bind("<<ComboboxSelected>>", refresh_operation)
+        if programming_operations:
+            operation.current(0)
+            refresh_operation()
 
         def inspection_values():
             return {
                 "inspector": inspector.get(),
-                "operation": operation.get(),
-                "machine": machine.get(),
+                "operation_number": selected_number(),
+                "report_type": report_type_value.cget("text"),
                 "status": status.get(),
                 "notes": notes.get("1.0", "end-1c"),
             }
@@ -1358,7 +1553,7 @@ class JobTravelerApp:
                 messagebox.showerror("Invalid Inspection", str(error), parent=self.root)
                 return
             if self._persist_candidate(candidate):
-                self.show_first_article()
+                self.show_dimensions(selected_number())
 
         buttons = ttk.Frame(content)
         buttons.pack(fill="x", pady=(20, 0))
@@ -1378,16 +1573,17 @@ class JobTravelerApp:
             command=self.show_job_detail,
         ).pack(side="left")
 
-    def show_first_article(self):
-        inspection = self.current_job.get("inspection", {})
-        if not isinstance(inspection, dict):
+    def show_dimensions(self, operation_number=1):
+        normalized = normalized_job(self.current_job)
+        record = terminal_app.operation_by_number(
+            normalized["inspection"]["records"], operation_number
+        )
+        if record is None:
             messagebox.showerror(
-                "Invalid Inspection",
-                "The saved inspection section is not a JSON object and cannot be edited safely.",
-                parent=self.root,
+                "Invalid Inspection", "Save the Inspection header first.", parent=self.root
             )
             return
-        saved_dimensions = inspection.get("dimensions", [])
+        saved_dimensions = record.get("dimensions", [])
         if not isinstance(saved_dimensions, list):
             messagebox.showerror(
                 "Invalid Dimensions",
@@ -1402,7 +1598,7 @@ class JobTravelerApp:
         content = scroll.content
         self.page_header(
             content,
-            "First Article Inspection",
+            f"Inspection Dimensions - Operation {operation_number}",
             "Add dimensions one at a time. Existing dimension numbers are preserved.",
         )
         dimensions = copy.deepcopy(saved_dimensions)
@@ -1516,8 +1712,8 @@ class JobTravelerApp:
 
         def save_dimensions():
             candidate = copy.deepcopy(self.current_job)
-            apply_dimensions_update(candidate, dimensions)
-            if self._persist_candidate(candidate, "First Article Inspection saved."):
+            apply_dimensions_update(candidate, dimensions, operation_number)
+            if self._persist_candidate(candidate, "Inspection dimensions saved."):
                 self.show_job_detail()
 
         buttons = ttk.Frame(content)

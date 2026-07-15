@@ -1,4 +1,5 @@
 # job_traveler.py
+import copy
 import json
 import os
 from datetime import datetime
@@ -35,6 +36,289 @@ TURNING_MACHINES = [
 ALL_MACHINES = MILLING_MACHINES + TURNING_MACHINES
 
 
+def blank_programming_operation(operation_number):
+    return {
+        "operation_number": operation_number,
+        "operation_type": "",
+        "program_name": "",
+        "revision": "",
+        "status": "Pending",
+        "last_updated": "",
+        "notes": "",
+    }
+
+
+def blank_cnc_operation(operation_number):
+    return {
+        "operation_number": operation_number,
+        "operator": "",
+        "machine": "",
+        "qty_complete": 0,
+        "status": "Pending",
+        "last_updated": "",
+        "notes": "",
+    }
+
+
+def infer_operation_type(*values):
+    """Infer a legacy operation type without inventing a machine."""
+    for value in values:
+        if value in ALLOWED_OPERATIONS:
+            return value
+        if value in MILLING_MACHINES:
+            return "Mill"
+        if value in TURNING_MACHINES:
+            return "Turning"
+    return ""
+
+
+def normalize_operations(job):
+    """Return a normalized copy; merely loading a legacy job never rewrites it."""
+    normalized = copy.deepcopy(job)
+    for section in SECTIONS:
+        normalized.setdefault(section, {})
+
+    programming = normalized.get("programming")
+    if not isinstance(programming, dict):
+        programming = {}
+    raw_programming_operations = programming.get("operations")
+    if isinstance(raw_programming_operations, list) and raw_programming_operations:
+        programming_operations = []
+        for number, raw in enumerate(raw_programming_operations, start=1):
+            operation = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+            operation["operation_number"] = number
+            operation.setdefault("operation_type", operation.pop("operation", ""))
+            for key, default in blank_programming_operation(number).items():
+                operation.setdefault(key, default)
+            programming_operations.append(operation)
+    else:
+        operation = blank_programming_operation(1)
+        operation.update(
+            {
+                "operation_type": infer_operation_type(
+                    programming.get("operation"), programming.get("machine")
+                ),
+                "program_name": programming.get("program_name", ""),
+                "revision": programming.get("revision", ""),
+                "status": programming.get("status", "Pending"),
+                "last_updated": programming.get("last_updated", ""),
+                "notes": programming.get("notes", ""),
+            }
+        )
+        programming_operations = [operation]
+    try:
+        requested_count = int(programming.get("operation_count", len(programming_operations)))
+    except (TypeError, ValueError):
+        requested_count = len(programming_operations)
+    requested_count = max(1, requested_count, len(programming_operations))
+    while len(programming_operations) < requested_count:
+        programming_operations.append(
+            blank_programming_operation(len(programming_operations) + 1)
+        )
+    programming["programmer"] = programming.get("programmer", "")
+    programming["operation_count"] = len(programming_operations)
+    programming["operations"] = programming_operations
+    normalized["programming"] = programming
+
+    cnc = normalized.get("cnc_machining")
+    if not isinstance(cnc, dict):
+        cnc = {}
+    raw_cnc_operations = cnc.get("operations")
+    if isinstance(raw_cnc_operations, list):
+        cnc_operations = []
+        for number, raw in enumerate(raw_cnc_operations, start=1):
+            operation = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+            operation["operation_number"] = number
+            if "qty_complete" not in operation:
+                operation["qty_complete"] = operation.pop("qty_completed", 0)
+            for key, default in blank_cnc_operation(number).items():
+                operation.setdefault(key, default)
+            operation.pop("first_article", None)
+            cnc_operations.append(operation)
+    else:
+        operation = blank_cnc_operation(1)
+        legacy_machine = cnc.get("machine") or programming.get("machine", "")
+        operation.update(
+            {
+                "operator": cnc.get("operator", ""),
+                "machine": legacy_machine,
+                "qty_complete": cnc.get("qty_complete", cnc.get("qty_completed", 0)),
+                "status": cnc.get("status", "Pending"),
+                "last_updated": cnc.get("last_updated", ""),
+                "notes": cnc.get("notes", ""),
+            }
+        )
+        cnc_operations = [operation]
+    while len(cnc_operations) < len(programming_operations):
+        cnc_operations.append(blank_cnc_operation(len(cnc_operations) + 1))
+    cnc["operations"] = cnc_operations
+    normalized["cnc_machining"] = cnc
+
+    inspection = normalized.get("inspection")
+    if not isinstance(inspection, dict):
+        inspection = {}
+    raw_records = inspection.get("records")
+    if isinstance(raw_records, list):
+        records = []
+        for row in raw_records:
+            if not isinstance(row, dict):
+                continue
+            record = copy.deepcopy(row)
+            try:
+                operation_number = int(record.get("operation_number"))
+            except (TypeError, ValueError):
+                continue
+            programming_operation = operation_by_number(
+                programming_operations, operation_number
+            )
+            cnc_operation = operation_by_number(cnc_operations, operation_number)
+            if programming_operation is None:
+                continue
+            record["operation_number"] = operation_number
+            record.setdefault(
+                "operation_type", programming_operation.get("operation_type", "")
+            )
+            record.setdefault(
+                "machine", cnc_operation.get("machine", "") if cnc_operation else ""
+            )
+            record.setdefault("dimensions", [])
+            records.append(record)
+    elif any(
+        key in inspection
+        for key in ("inspector", "dimensions", "operation", "machine", "status")
+    ):
+        records = [
+            {
+                "operation_number": 1,
+                "operation_type": infer_operation_type(
+                    inspection.get("operation"), programming_operations[0]["operation_type"]
+                ),
+                "machine": inspection.get("machine") or cnc_operations[0].get("machine", ""),
+                "inspector": inspection.get("inspector", ""),
+                "report_type": inspection.get("report_type", ""),
+                "status": inspection.get("status", "Pending"),
+                "last_updated": inspection.get("last_updated", ""),
+                "notes": inspection.get("notes", ""),
+                "dimensions": copy.deepcopy(inspection.get("dimensions", [])),
+            }
+        ]
+    else:
+        records = []
+    inspection["records"] = records
+    normalized["inspection"] = inspection
+    return normalized
+
+
+def canonical_job(job):
+    """Return the save-time schema while retaining unrelated compatible fields."""
+    canonical = normalize_operations(job)
+    programming = canonical["programming"]
+    for key in (
+        "program_name",
+        "revision",
+        "operation",
+        "machine",
+        "status",
+        "last_updated",
+        "notes",
+    ):
+        programming.pop(key, None)
+    cnc = canonical["cnc_machining"]
+    for key in (
+        "operator",
+        "machine",
+        "qty_completed",
+        "qty_complete",
+        "status",
+        "last_updated",
+        "notes",
+        "first_article",
+    ):
+        cnc.pop(key, None)
+    inspection = canonical["inspection"]
+    for key in (
+        "inspector",
+        "report_type",
+        "operation",
+        "machine",
+        "status",
+        "dimensions",
+        "notes",
+        "last_updated",
+    ):
+        inspection.pop(key, None)
+    return canonical
+
+
+def operation_by_number(operations, operation_number):
+    for operation in operations:
+        if operation.get("operation_number") == operation_number:
+            return operation
+    return None
+
+
+def operation_has_data(operation, ignored=("operation_number",)):
+    if not isinstance(operation, dict):
+        return False
+    for key, value in operation.items():
+        if key in ignored:
+            continue
+        if value not in ("", None, 0, "Pending", []):
+            return True
+    return False
+
+
+def resize_operation_plan(job, new_count, confirm_removal=False):
+    """Resize a normalized plan, refusing to discard downstream records."""
+    if isinstance(new_count, bool) or not isinstance(new_count, int) or new_count <= 0:
+        raise ValueError("Number of Operations Required must be a positive whole number.")
+    normalized = normalize_operations(job)
+    programming = normalized["programming"]
+    old_count = programming["operation_count"]
+    if new_count < old_count:
+        removed = set(range(new_count + 1, old_count + 1))
+        used_cnc = [
+            row.get("operation_number")
+            for row in normalized["cnc_machining"]["operations"]
+            if row.get("operation_number") in removed and operation_has_data(row)
+        ]
+        used_inspection = [
+            row.get("operation_number")
+            for row in normalized["inspection"]["records"]
+            if row.get("operation_number") in removed and operation_has_data(row)
+        ]
+        if used_cnc or used_inspection:
+            numbers = sorted(set(used_cnc + used_inspection))
+            raise ValueError(
+                "Cannot reduce operations because production or inspection data exists "
+                f"for Operation(s) {', '.join(map(str, numbers))}."
+            )
+        if not confirm_removal:
+            raise ValueError("Confirm removal of the unused blank operation(s).")
+        programming["operations"] = programming["operations"][:new_count]
+        normalized["cnc_machining"]["operations"] = [
+            row
+            for row in normalized["cnc_machining"]["operations"]
+            if row.get("operation_number", 0) <= new_count
+        ]
+        normalized["inspection"]["records"] = [
+            row
+            for row in normalized["inspection"]["records"]
+            if row.get("operation_number", 0) <= new_count
+        ]
+    else:
+        while len(programming["operations"]) < new_count:
+            programming["operations"].append(
+                blank_programming_operation(len(programming["operations"]) + 1)
+            )
+        while len(normalized["cnc_machining"]["operations"]) < new_count:
+            normalized["cnc_machining"]["operations"].append(
+                blank_cnc_operation(len(normalized["cnc_machining"]["operations"]) + 1)
+            )
+    programming["operation_count"] = new_count
+    return normalized
+
+
 def get_int(prompt):
     while True:
         raw = input(prompt).strip()
@@ -42,6 +326,21 @@ def get_int(prompt):
             return int(raw)
         except ValueError:
             print("Invalid number. Enter a whole number.")
+
+
+def get_positive_int(prompt, current=None):
+    while True:
+        suffix = f" [current: {current}]" if current is not None else ""
+        raw = input(f"{prompt}{suffix}: ").strip()
+        if raw == "" and current is not None:
+            return current
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0 and str(value) == raw.lstrip("+"):
+            return value
+        print("Invalid number. Enter a positive whole number.")
 
 
 def get_yes_or_no(prompt):
@@ -141,61 +440,6 @@ def get_operation(section_data):
         print("Invalid choice. Please choose 1 or 2.")
 
 
-def choose_machine(prompt):
-    while True:
-        print(f"\n{prompt}")
-
-        for index, machine in enumerate(ALL_MACHINES, start=1):
-            print(f"{index}. {machine}")
-
-        choice = input("Choose a machine: ").strip()
-
-        try:
-            choice_number = int(choice)
-        except ValueError:
-            print("Invalid choice. Please choose a number from the list.")
-            continue
-
-        if 1 <= choice_number <= len(ALL_MACHINES):
-            return ALL_MACHINES[choice_number - 1]
-
-        print("Invalid choice. Please choose a number from the list.")
-
-
-def get_existing_machine_or_new(section_data, prompt):
-    current_machine = section_data.get("machine")
-
-    while True:
-        print(f"\n{prompt}")
-
-        if has_existing_value(section_data, "machine"):
-            print(f"Current machine: {current_machine}")
-
-            if current_machine in ALL_MACHINES:
-                print("Press Enter to keep the current machine.")
-            else:
-                print("Choose one of the allowed machines below.")
-
-        for index, machine in enumerate(ALL_MACHINES, start=1):
-            print(f"{index}. {machine}")
-
-        choice = input("Choose a machine: ").strip()
-
-        if choice == "" and current_machine in ALL_MACHINES:
-            return current_machine
-
-        try:
-            choice_number = int(choice)
-        except ValueError:
-            print("Invalid choice. Please choose a number from the list.")
-            continue
-
-        if 1 <= choice_number <= len(ALL_MACHINES):
-            return ALL_MACHINES[choice_number - 1]
-
-        print("Invalid choice. Please choose a number from the list.")
-
-
 def get_machine_for_operation(section_data, operation):
     current_machine = section_data.get("machine")
 
@@ -233,6 +477,25 @@ def get_machine_for_operation(section_data, operation):
             return machines[choice_number - 1]
 
         print("Invalid choice. Please choose a number from the list.")
+
+
+def choose_configured_operation(programming_operations):
+    while True:
+        print("\nConfigured Operations")
+        for operation in programming_operations:
+            print(
+                f"{operation['operation_number']}. Operation "
+                f"{operation['operation_number']} - "
+                f"{operation.get('operation_type') or BLANK}"
+            )
+        choice = input("Choose an operation: ").strip()
+        try:
+            number = int(choice)
+        except ValueError:
+            number = 0
+        if operation_by_number(programming_operations, number):
+            return number
+        print("Invalid choice. Choose a configured operation number.")
 
 
 def get_dimension_result():
@@ -276,18 +539,6 @@ def get_required_quantity(job):
         return None
 
 
-def get_cnc_machine(job, cnc_machining):
-    programming = job.get("programming", {})
-
-    if has_existing_value(programming, "machine"):
-        return programming["machine"]
-
-    if has_existing_value(cnc_machining, "machine"):
-        return cnc_machining["machine"]
-
-    return choose_machine("Machine")
-
-
 def get_cnc_status(job, qty_completed, current_status):
     required_quantity = get_required_quantity(job)
 
@@ -310,8 +561,12 @@ def save_job(job):
 
     filename = os.path.join(JOBS_FOLDER, f"{job['job_number']}.json")
 
+    saved_job = canonical_job(job)
     with open(filename, "w") as file:
-        json.dump(job, file, indent=4)
+        json.dump(saved_job, file, indent=4)
+
+    job.clear()
+    job.update(saved_job)
 
     print(f"\nSaved job traveler to {filename}")
 
@@ -403,7 +658,24 @@ def blank_if_missing(job, section, key):
 
 
 def status_if_missing(job, section):
-    value = job.get(section, {}).get("status")
+    section_data = job.get(section, {})
+    if isinstance(section_data, dict):
+        rows = None
+        if section in ("programming", "cnc_machining"):
+            rows = section_data.get("operations")
+        elif section == "inspection":
+            rows = section_data.get("records")
+        if isinstance(rows, list) and rows:
+            statuses = [
+                row.get("status", "Pending") if isinstance(row, dict) else "Pending"
+                for row in rows
+            ]
+            if all(value == "Completed" for value in statuses):
+                return "Completed"
+            if any(value in ("In Progress", "Completed") for value in statuses):
+                return "In Progress"
+            return "Pending"
+    value = section_data.get("status") if isinstance(section_data, dict) else None
 
     if value == "" or value is None or value not in ALLOWED_STATUSES:
         return "Pending"
@@ -430,6 +702,7 @@ def job_field(job, key):
 
 
 def print_traveler(job):
+    job = normalize_operations(job)
     print("\n" + "=" * 60)
     print("JOB TRAVELER")
     print("=" * 60)
@@ -445,14 +718,20 @@ def print_traveler(job):
     print("\n" + "-" * 60)
     print("PROGRAMMING")
     print("-" * 60)
-    print(f"Programmer:    {blank_if_missing(job, 'programming', 'programmer')}")
-    print(f"Program Name:  {blank_if_missing(job, 'programming', 'program_name')}")
-    print(f"Revision:      {blank_if_missing(job, 'programming', 'revision')}")
-    print(f"Operation:     {operation_if_missing(job, 'programming')}")
-    print(f"Machine:       {blank_if_missing(job, 'programming', 'machine')}")
-    print(f"Status:        {status_if_missing(job, 'programming')}")
-    print(f"Last Updated:  {blank_if_missing(job, 'programming', 'last_updated')}")
-    print(f"Notes:         {blank_if_missing(job, 'programming', 'notes')}")
+    programming = job["programming"]
+    print(f"Programmer:          {programming.get('programmer') or BLANK}")
+    print(f"Operations Required: {programming['operation_count']}")
+    print("OP | TYPE | PROGRAM | REVISION | STATUS | LAST UPDATED | NOTES")
+    for operation in programming["operations"]:
+        print(
+            f"{operation['operation_number']} | "
+            f"{operation.get('operation_type') or BLANK} | "
+            f"{operation.get('program_name') or BLANK} | "
+            f"{operation.get('revision') or BLANK} | "
+            f"{operation.get('status') or 'Pending'} | "
+            f"{operation.get('last_updated') or BLANK} | "
+            f"{operation.get('notes') or BLANK}"
+        )
 
     print("\n" + "-" * 60)
     print("SAW CUTTING")
@@ -467,13 +746,21 @@ def print_traveler(job):
     print("\n" + "-" * 60)
     print("CNC MACHINING")
     print("-" * 60)
-    print(f"Operator:      {blank_if_missing(job, 'cnc_machining', 'operator')}")
-    print(f"Machine:       {blank_if_missing(job, 'cnc_machining', 'machine')}")
-    print(f"Qty Complete:  {blank_if_missing(job, 'cnc_machining', 'qty_completed')}")
-    print(f"First Article: {blank_if_missing(job, 'cnc_machining', 'first_article')}")
-    print(f"Status:        {status_if_missing(job, 'cnc_machining')}")
-    print(f"Last Updated:  {blank_if_missing(job, 'cnc_machining', 'last_updated')}")
-    print(f"Notes:         {blank_if_missing(job, 'cnc_machining', 'notes')}")
+    print("OP | TYPE | OPERATOR | MACHINE | QTY COMPLETE | STATUS | LAST UPDATED | NOTES")
+    for operation in job["cnc_machining"]["operations"]:
+        programming_operation = operation_by_number(
+            programming["operations"], operation["operation_number"]
+        ) or {}
+        print(
+            f"{operation['operation_number']} | "
+            f"{programming_operation.get('operation_type') or BLANK} | "
+            f"{operation.get('operator') or BLANK} | "
+            f"{operation.get('machine') or BLANK} | "
+            f"{operation.get('qty_complete', 0)} | "
+            f"{operation.get('status') or 'Pending'} | "
+            f"{operation.get('last_updated') or BLANK} | "
+            f"{operation.get('notes') or BLANK}"
+        )
 
     print("\n" + "-" * 60)
     print("DEBURR")
@@ -488,42 +775,35 @@ def print_traveler(job):
     print("\n" + "-" * 60)
     print("INSPECTION")
     print("-" * 60)
-    print(f"Inspector:     {blank_if_missing(job, 'inspection', 'inspector')}")
-    print(f"Report Type:   {blank_if_missing(job, 'inspection', 'report_type')}")
-    print(f"Operation:     {operation_if_missing(job, 'inspection')}")
-    print(f"Machine:       {blank_if_missing(job, 'inspection', 'machine')}")
-    print(f"Status:        {status_if_missing(job, 'inspection')}")
-    print(f"Last Updated:  {blank_if_missing(job, 'inspection', 'last_updated')}")
-    print(f"Notes:         {blank_if_missing(job, 'inspection', 'notes')}")
-
-    dimensions = job.get("inspection", {}).get("dimensions", [])
-
-    if not isinstance(dimensions, list):
-        dimensions = []
-
-    if dimensions:
-        print()
+    records = job["inspection"]["records"]
+    if not records:
+        print(f"Dimensions:    {BLANK}")
+    for record in records:
+        print(f"\nOperation Number: {record.get('operation_number', BLANK)}")
+        print(f"Operation Type:   {record.get('operation_type') or BLANK}")
+        print(f"Machine:          {record.get('machine') or BLANK}")
+        print(f"Inspector:        {record.get('inspector') or BLANK}")
+        print(f"Report Type:      {record.get('report_type') or BLANK}")
+        print(f"Status:           {record.get('status') or 'Pending'}")
+        print(f"Last Updated:     {record.get('last_updated') or BLANK}")
+        print(f"Notes:            {record.get('notes') or BLANK}")
+        dimensions = record.get("dimensions", [])
+        if not isinstance(dimensions, list) or not dimensions:
+            print(f"Dimensions:       {BLANK}")
+            continue
         print("DIM | TARGET | TOLERANCE | FINDING | EQUIPMENT | RESULT")
-
         for dimension in dimensions:
-            if not isinstance(dimension, dict):
-                dimension = {}
-
+            dimension = dimension if isinstance(dimension, dict) else {}
             equipment = dimension.get(
-                "measurement_equipment_used",
-                dimension.get("tool_used", BLANK),
+                "measurement_equipment_used", dimension.get("tool_used", BLANK)
             )
-
             print(
                 f"{dimension.get('dimension_number', BLANK)} | "
                 f"{dimension.get('target_dimension', BLANK)} | "
                 f"{dimension.get('tolerance', BLANK)} | "
-                f"{dimension.get('finding', BLANK)} | "
-                f"{equipment} | "
+                f"{dimension.get('finding', BLANK)} | {equipment} | "
                 f"{dimension.get('result', BLANK)}"
             )
-    else:
-        print(f"Dimensions:    {BLANK}")
 
     print("\n" + "-" * 60)
     print("PACKING")
@@ -569,33 +849,55 @@ def update_programming(job):
     print("\nUpdate Programming")
     print("-" * 30)
 
-    programming = job["programming"]
-    programmer = get_existing_or_new(programming, "programmer", "Programmer")
-    program_name = get_existing_or_new(programming, "program_name", "Program Name")
-    revision = get_existing_or_new(programming, "revision", "Revision")
-    machine = get_existing_machine_or_new(programming, "Machine")
-    if machine in MILLING_MACHINES:
-        operation = "Mill"
-    elif machine in TURNING_MACHINES:
-        operation = "Turning"
+    normalized = normalize_operations(job)
+    programming = normalized["programming"]
+    programmer = get_existing_or_new(programming, "programmer", "Programmer Name")
+    operation_count = get_positive_int(
+        "Number of Operations Required", programming["operation_count"]
+    )
+    if operation_count < programming["operation_count"]:
+        try:
+            candidate = resize_operation_plan(normalized, operation_count)
+        except ValueError as error:
+            if "Confirm removal" not in str(error):
+                print(f"\n{error}")
+                return False
+            if not get_yes_or_no("Remove the unused blank operation(s)? (y/n): "):
+                print("Operation count was not changed.")
+                return False
+            candidate = resize_operation_plan(normalized, operation_count, True)
     else:
-        operation = programming.get("operation", "")
-    status = get_status(programming)
-    last_updated = get_timestamp()
-    notes = get_existing_or_new(programming, "notes", "Notes")
-
-    job["programming"] = {
-        "programmer": programmer,
-        "program_name": program_name,
-        "revision": revision,
-        "operation": operation,
-        "machine": machine,
-        "status": status,
-        "last_updated": last_updated,
-        "notes": notes,
-    }
-
+        candidate = resize_operation_plan(normalized, operation_count)
+    programming = candidate["programming"]
+    programming["programmer"] = programmer
+    for operation in programming["operations"]:
+        number = operation["operation_number"]
+        print(f"\nOperation {number}")
+        print("-" * 30)
+        operation["operation_type"] = get_operation(
+            {"operation": operation.get("operation_type", "")}
+        )
+        operation["program_name"] = get_existing_or_new(
+            operation, "program_name", "Program Name"
+        )
+        operation["revision"] = get_existing_or_new(operation, "revision", "Revision")
+        operation["status"] = get_status(operation)
+        operation["last_updated"] = get_timestamp()
+        operation["notes"] = get_existing_or_new(operation, "notes", "Notes")
+    for key in (
+        "program_name",
+        "revision",
+        "operation",
+        "machine",
+        "status",
+        "last_updated",
+        "notes",
+    ):
+        programming.pop(key, None)
+    job.clear()
+    job.update(candidate)
     save_job(job)
+    return True
 
 
 def update_saw_cutting(job):
@@ -621,32 +923,55 @@ def update_cnc_machining(job):
     print("\nUpdate CNC Machining")
     print("-" * 30)
 
-    cnc_machining = job["cnc_machining"]
-    operator = get_existing_or_new(cnc_machining, "operator", "Operator Name")
+    normalized = normalize_operations(job)
+    programming_operations = normalized["programming"]["operations"]
+    operation_number = choose_configured_operation(programming_operations)
+    programming_operation = operation_by_number(programming_operations, operation_number)
+    operation_type = programming_operation.get("operation_type", "")
+    if operation_type not in ALLOWED_OPERATIONS:
+        print("\nThis operation needs a Mill or Turning type in Programming first.")
+        return False
+    print(f"Operation Type: {operation_type}")
+    cnc_operations = normalized["cnc_machining"]["operations"]
+    cnc_operation = operation_by_number(cnc_operations, operation_number)
+    operator = get_existing_or_new(cnc_operation, "operator", "Operator Name")
+    machine = get_machine_for_operation(cnc_operation, operation_type)
     qty_completed = get_existing_int_or_new(
-        cnc_machining,
-        "qty_completed",
+        {**cnc_operation, "qty_complete": cnc_operation.get("qty_complete", 0)},
+        "qty_complete",
         "Quantity Pieces Completed",
     )
-    machine = get_cnc_machine(job, cnc_machining)
     status = get_cnc_status(
-        job,
+        normalized,
         qty_completed,
-        cnc_machining.get("status"),
+        cnc_operation.get("status"),
     )
-
-    job["cnc_machining"] = {
-        "operator": operator,
-        "machine": machine,
-        "qty_completed": qty_completed,
-        "qty_rejected": cnc_machining.get("qty_rejected", 0),
-        "first_article": cnc_machining.get("first_article", ""),
-        "status": status,
-        "last_updated": get_timestamp(),
-        "notes": cnc_machining.get("notes", ""),
-    }
-
+    cnc_operation.update(
+        {
+            "operator": operator,
+            "machine": machine,
+            "qty_complete": qty_completed,
+            "status": status,
+            "last_updated": get_timestamp(),
+            "notes": get_existing_or_new(cnc_operation, "notes", "Notes"),
+        }
+    )
+    cnc = normalized["cnc_machining"]
+    for key in (
+        "operator",
+        "machine",
+        "qty_completed",
+        "qty_complete",
+        "status",
+        "last_updated",
+        "notes",
+        "first_article",
+    ):
+        cnc.pop(key, None)
+    job.clear()
+    job.update(normalized)
     save_job(job)
+    return True
 
 
 def update_deburr(job):
@@ -671,20 +996,38 @@ def update_inspection(job):
     print("\nUpdate Inspection")
     print("-" * 30)
 
-    inspection = job["inspection"]
-    dimensions = inspection.get("dimensions", [])
+    normalized = normalize_operations(job)
+    programming_operations = normalized["programming"]["operations"]
+    operation_number = choose_configured_operation(programming_operations)
+    programming_operation = operation_by_number(programming_operations, operation_number)
+    cnc_operation = operation_by_number(
+        normalized["cnc_machining"]["operations"], operation_number
+    )
+    machine = cnc_operation.get("machine", "") if cnc_operation else ""
+    if not machine:
+        print(
+            "\nNo CNC machine is assigned to this operation. "
+            "Assign the machine in CNC Machining first."
+        )
+        return False
+    operation_type = programming_operation.get("operation_type", "")
+    print(f"Operation: Operation {operation_number} - {operation_type or BLANK}")
+    print(f"Machine: {machine}")
+    inspection = normalized["inspection"]
+    record = operation_by_number(inspection["records"], operation_number)
+    if record is None:
+        record = {"operation_number": operation_number, "dimensions": []}
+        inspection["records"].append(record)
+    dimensions = record.get("dimensions", [])
 
     if not isinstance(dimensions, list):
         dimensions = []
 
-    inspection["inspector"] = get_existing_or_new(inspection, "inspector", "Inspector")
-    inspection["report_type"] = "First Article Inspection"
-    inspection["operation"] = get_operation(inspection)
-    inspection["machine"] = get_machine_for_operation(
-        inspection,
-        inspection["operation"],
-    )
-    inspection["status"] = get_status(inspection)
+    record["operation_type"] = operation_type
+    record["machine"] = machine
+    record["inspector"] = get_existing_or_new(record, "inspector", "Inspector")
+    record["report_type"] = record.get("report_type") or "First Article Inspection"
+    record["status"] = get_status(record)
 
     add_dimensions = False
 
@@ -723,11 +1066,24 @@ def update_inspection(job):
 
             dimension_number += 1
 
-    inspection["dimensions"] = dimensions
-    inspection["notes"] = get_existing_or_new(inspection, "notes", "Notes")
-    inspection["last_updated"] = get_timestamp()
-
+    record["dimensions"] = dimensions
+    record["notes"] = get_existing_or_new(record, "notes", "Notes")
+    record["last_updated"] = get_timestamp()
+    for key in (
+        "inspector",
+        "report_type",
+        "operation",
+        "machine",
+        "status",
+        "dimensions",
+        "notes",
+        "last_updated",
+    ):
+        inspection.pop(key, None)
+    job.clear()
+    job.update(normalized)
     save_job(job)
+    return True
 
 
 def update_packing(job):

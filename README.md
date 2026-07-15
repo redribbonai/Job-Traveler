@@ -22,18 +22,36 @@ This app creates digital job travelers for machine shop jobs. Each traveler is s
 - Add timestamps when sections are updated
 - Print a paper-style traveler with blanks for missing fields
 
-## Inspection
+## Multi-operation workflow
 
-The Inspection section is a First Article Inspection Report. It records:
+Programming defines one or more sequential machining operations. Each operation
+records its type (`Mill` or `Turning`), program, revision, status, update time,
+and notes. Programming does not assign a machine.
 
-- Inspector
-- Operation: Mill or Turning
-- Machine
+CNC Machining selects one configured operation and records its operator,
+official machine, completed quantity, automatically calculated status, update
+time, and notes. Machine choices are filtered by the operation type.
+
+Inspection selects a configured operation. Its operation type comes from
+Programming and its machine comes from that operation's CNC Machining record;
+neither value is manually entered again. A CNC machine must be assigned before
+the inspection can be saved. Inspection records preserve:
+
+- Inspector and report type
+- Selected operation number
+- Automatic operation type and machine snapshots
 - Target Dimension
 - Tolerance
 - Finding / Actual Dimension
 - Measurement Equipment Used
 - Pass / Rejected result
+
+The JSON structure uses `programming.operations`, `cnc_machining.operations`,
+and operation-linked `inspection.records` lists. Existing single-operation jobs
+are read as Operation 1 in memory. Their legacy CNC machine is preferred, with
+the old Programming machine used only when the CNC machine is blank. Files are
+not rewritten just by opening or printing them; the normalized structure is
+saved after an actual workflow update.
 
 Scrap, reject, and fail numbers are not printed on the public traveler. They may be used later for private boss reports.
 
@@ -41,6 +59,7 @@ Scrap, reject, and fail numbers are not printed on the public traveler. They may
 
 ```bash
 python3 job_traveler.py
+```
 
 #Main Menu
 
