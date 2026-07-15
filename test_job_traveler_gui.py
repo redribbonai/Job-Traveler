@@ -1,6 +1,7 @@
 """Multi-operation terminal and GUI business-workflow tests."""
 
 import copy
+import hashlib
 import io
 import json
 import subprocess
@@ -30,6 +31,64 @@ class MultiOperationTravelerTests(unittest.TestCase):
 
     def new_job(self):
         return gui.create_job_record(self.header)
+
+    def legacy_job_316_fixture(self):
+        """Return a representative pre-multi-operation traveler without shop data."""
+        return {
+            "job_number": "316",
+            "customer": "Legacy Test Customer",
+            "part_number": "LEGACY-316",
+            "description": "Legacy single-operation traveler fixture",
+            "qty_to_make": 20,
+            "material": "Steel",
+            "cut_length": "12",
+            "programming": {
+                "programmer": "Legacy Programmer",
+                "program_name": "OP10",
+                "revision": "A",
+                "machine": "DNM 5700L",
+                "status": "Completed",
+                "last_updated": "2026-01-01 08:00",
+                "notes": "Legacy programming note",
+            },
+            "cnc_machining": {
+                "operator": "Legacy Operator",
+                "machine": "DNM 4500",
+                "qty_completed": 20,
+                "first_article": "Legacy field that must not display",
+                "status": "Completed",
+                "last_updated": "2026-01-01 09:00",
+                "notes": "Legacy CNC note",
+            },
+            "inspection": {
+                "inspector": "Legacy Inspector",
+                "report_type": "First Article Inspection",
+                "operation": "Mill",
+                "machine": "DNM 5700L",
+                "status": "Completed",
+                "last_updated": "2026-01-01 10:00",
+                "notes": "Legacy inspection note",
+                "dimensions": [
+                    {
+                        "dimension_number": 1,
+                        "target_dimension": "5",
+                        "tolerance": ".005",
+                        "finding": "5",
+                        "measurement_equipment_used": "Caliper",
+                        "result": "Pass",
+                    }
+                ],
+            },
+            "saw_cutting": {},
+            "deburr": {},
+            "packing": {},
+            "shipping": {},
+        }
+
+    def write_legacy_fixture(self, directory):
+        path = Path(directory) / "316.json"
+        path.write_text(json.dumps(self.legacy_job_316_fixture(), indent=2), encoding="utf-8")
+        return path
 
     def programmed_job(self, count=2):
         job = self.new_job()
@@ -215,39 +274,53 @@ class MultiOperationTravelerTests(unittest.TestCase):
         self.assertEqual(len(reduced["cnc_machining"]["operations"]), 1)
 
     def test_job_316_style_legacy_json_normalizes_as_operation_one(self):
-        legacy = json.loads((self.repository / "jobs" / "316.json").read_text())
-        normalized = gui.normalized_job(legacy)
-        self.assertEqual(normalized["programming"]["operations"][0]["operation_number"], 1)
-        self.assertEqual(normalized["programming"]["operations"][0]["operation_type"], "Mill")
-        cnc = normalized["cnc_machining"]["operations"][0]
-        self.assertEqual(cnc["machine"], "DNM 4500")
-        self.assertEqual(cnc["qty_complete"], 20)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_legacy_fixture(directory)
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            with mock.patch.object(terminal_app, "JOBS_FOLDER", directory):
+                loaded = terminal_app.load_job("316")
+            normalized = gui.load_job_data("316", directory)
+            self.assertEqual(loaded["job_number"], "316")
+            self.assertEqual(normalized["programming"]["operations"][0]["operation_number"], 1)
+            self.assertEqual(normalized["programming"]["operations"][0]["operation_type"], "Mill")
+            cnc = normalized["cnc_machining"]["operations"][0]
+            self.assertEqual(cnc["machine"], "DNM 4500")
+            self.assertEqual(cnc["qty_complete"], 20)
+            self.assertEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
+
+            gui.save_job_data(normalized, directory)
+            canonical = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("machine", canonical["programming"])
+            self.assertNotIn("first_article", canonical["cnc_machining"])
+            self.assertIn("operations", canonical["cnc_machining"])
+            self.assertNotEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
 
     def test_legacy_programming_machine_is_only_fallback_when_cnc_blank(self):
-        legacy = {
-            "job_number": "LEGACY",
-            "qty_to_make": 5,
-            "programming": {"machine": terminal_app.MILLING_MACHINES[0]},
-            "cnc_machining": {"machine": ""},
-        }
+        legacy = self.legacy_job_316_fixture()
+        legacy["cnc_machining"]["machine"] = ""
         normalized = gui.normalized_job(legacy)
         self.assertEqual(
             normalized["cnc_machining"]["operations"][0]["machine"],
-            terminal_app.MILLING_MACHINES[0],
+            "DNM 5700L",
         )
-        legacy["cnc_machining"]["machine"] = terminal_app.MILLING_MACHINES[1]
+        legacy["cnc_machining"]["machine"] = "DNM 4500"
         normalized = gui.normalized_job(legacy)
         self.assertEqual(
             normalized["cnc_machining"]["operations"][0]["machine"],
-            terminal_app.MILLING_MACHINES[1],
+            "DNM 4500",
         )
 
     def test_existing_inspection_data_continues_printing(self):
-        legacy = json.loads((self.repository / "jobs" / "316.json").read_text())
-        text = gui.traveler_text(legacy)
-        self.assertIn("Operation Number: 1", text)
-        self.assertIn("Caliper", text)
-        self.assertIn("5 | .005 | 5", text)
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_legacy_fixture(directory)
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            legacy = gui.load_job_path(path)
+            text = gui.traveler_text(legacy)
+            self.assertIn("Operation Number: 1", text)
+            self.assertIn("Caliper", text)
+            self.assertIn("5 | .005 | 5", text)
+            self.assertNotIn("First Article:", text)
+            self.assertEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
 
     def test_gui_update_helpers_target_selected_operation(self):
         job = self.programmed_job()
