@@ -448,6 +448,7 @@ def print_traveler(job):
     print(f"Programmer:    {blank_if_missing(job, 'programming', 'programmer')}")
     print(f"Program Name:  {blank_if_missing(job, 'programming', 'program_name')}")
     print(f"Revision:      {blank_if_missing(job, 'programming', 'revision')}")
+    print(f"Operation:     {operation_if_missing(job, 'programming')}")
     print(f"Machine:       {blank_if_missing(job, 'programming', 'machine')}")
     print(f"Status:        {status_if_missing(job, 'programming')}")
     print(f"Last Updated:  {blank_if_missing(job, 'programming', 'last_updated')}")
@@ -569,15 +570,29 @@ def update_programming(job):
     print("-" * 30)
 
     programming = job["programming"]
+    programmer = get_existing_or_new(programming, "programmer", "Programmer")
+    program_name = get_existing_or_new(programming, "program_name", "Program Name")
+    revision = get_existing_or_new(programming, "revision", "Revision")
+    machine = get_existing_machine_or_new(programming, "Machine")
+    if machine in MILLING_MACHINES:
+        operation = "Mill"
+    elif machine in TURNING_MACHINES:
+        operation = "Turning"
+    else:
+        operation = programming.get("operation", "")
+    status = get_status(programming)
+    last_updated = get_timestamp()
+    notes = get_existing_or_new(programming, "notes", "Notes")
 
     job["programming"] = {
-        "programmer": get_existing_or_new(programming, "programmer", "Programmer"),
-        "program_name": get_existing_or_new(programming, "program_name", "Program Name"),
-        "revision": get_existing_or_new(programming, "revision", "Revision"),
-        "machine": get_existing_machine_or_new(programming, "Machine"),
-        "status": get_status(programming),
-        "last_updated": get_timestamp(),
-        "notes": get_existing_or_new(programming, "notes", "Notes"),
+        "programmer": programmer,
+        "program_name": program_name,
+        "revision": revision,
+        "operation": operation,
+        "machine": machine,
+        "status": status,
+        "last_updated": last_updated,
+        "notes": notes,
     }
 
     save_job(job)
