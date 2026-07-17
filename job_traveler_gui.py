@@ -8,21 +8,45 @@ they can also be exercised safely by automated tests.
 from __future__ import annotations
 
 import copy
+import html
 import io
 import json
 import os
 import re
 import tempfile
 import tkinter as tk
+import webbrowser
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import messagebox, ttk
+from zoneinfo import ZoneInfo
 
 import job_traveler as terminal_app
+from gui_theme import (
+    BACKGROUND,
+    BORDER,
+    FAIL,
+    MUTED_TEXT,
+    PASS,
+    PREVIEW_TABLE_HEIGHT,
+    SPACE_CONTROL,
+    SPACE_GROUP,
+    SPACE_SECTION,
+    SPACE_TIGHT,
+    apply_shopos_theme,
+    style_text_widget,
+)
+
+
+# Search for "CUSTOMIZE:" in this file and gui_theme.py to find the editable
+# appearance settings without changing traveler workflow logic.
 
 
 APP_TITLE = "JOB TRAVELER"
 BASE_DIR = Path(__file__).resolve().parent
+SHOP_TIMEZONE = ZoneInfo("America/New_York")
+REPORT_COMPANY_NAME = "Red Ribbon ShopOS"
 HEADER_FIELDS = (
     "job_number",
     "customer",
@@ -41,6 +65,358 @@ WINDOWS_RESERVED_NAMES = {
     *(f"COM{number}" for number in range(1, 10)),
     *(f"LPT{number}" for number in range(1, 10)),
 }
+
+
+def status_label_style(value):
+    """Return a semantic label style without changing saved status values."""
+    normalized = clean_text(value).casefold()
+    if normalized in {"completed", "complete", "pass", "passed"}:
+        return "Success.TLabel"
+    if normalized in {"failed", "fail", "rejected"}:
+        return "Fail.TLabel"
+    return "Status.TLabel"
+
+
+def status_badge_style(value):
+    """Map saved workflow labels to TradingView-style status badges."""
+    normalized = clean_text(value).casefold()
+    if normalized in {"completed", "complete", "pass", "passed"}:
+        return "Completed.Badge.TLabel"
+    if normalized in {"in progress", "active", "running"}:
+        return "Progress.Badge.TLabel"
+    if normalized in {"failed", "fail", "rejected", "blocked"}:
+        return "Failed.Badge.TLabel"
+    if normalized in {"pending", "warning"}:
+        return "Pending.Badge.TLabel"
+    return "Unknown.Badge.TLabel"
+
+
+def display_value(value, missing="—"):
+    """Return a compact GUI value without terminal underscore placeholders."""
+    if value is None or value == "" or value == terminal_app.BLANK:
+        return missing
+    return str(value)
+
+
+def format_shop_timestamp(value):
+    """Format aware UTC or legacy Florida-local timestamps for GUI display."""
+    text = clean_text(value)
+    if not text:
+        return "—"
+    parsed = None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        for pattern in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(text, pattern)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return "—"
+    # Legacy Job Traveler timestamps came from datetime.now() on the Florida
+    # workstation, so naive values represent Eastern wall time rather than UTC.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=SHOP_TIMEZONE)
+    else:
+        parsed = parsed.astimezone(SHOP_TIMEZONE)
+    hour = parsed.strftime("%I").lstrip("0") or "12"
+    return f"{parsed:%b} {parsed.day}, {parsed.year} at {hour}:{parsed:%M %p %Z}"
+
+
+def format_shop_date(value):
+    """Format ISO ship dates while preserving already-readable operator text."""
+    text = clean_text(value)
+    if not text:
+        return "—"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(SHOP_TIMEZONE)
+    return f"{parsed:%b} {parsed.day}, {parsed.year}"
+
+
+def _print_value(value, missing="Not recorded"):
+    """Escape one job-data value for safe insertion into the print HTML."""
+    if value == "—":
+        value = None
+    shown = display_value(value, missing)
+    return html.escape(shown, quote=True)
+
+
+def _print_timestamp(value):
+    shown = format_shop_timestamp(value)
+    return _print_value(None if shown == "—" else shown)
+
+
+def _print_status(value, missing="Pending"):
+    """Render an escaped textual status that remains clear in grayscale."""
+    shown = display_value(value, missing)
+    normalized = clean_text(shown).casefold()
+    if normalized == "completed":
+        css_class = "status-completed"
+    elif normalized == "in progress":
+        css_class = "status-progress"
+    elif normalized in {"failed", "fail", "rejected", "blocked"}:
+        css_class = "status-failed"
+    else:
+        css_class = "status-pending"
+    return f'<span class="status {css_class}">{html.escape(shown, quote=True)}</span>'
+
+
+def _print_field_grid(fields):
+    return "".join(
+        '<div class="field"><div class="field-label">'
+        f"{html.escape(label, quote=True)}</div>"
+        f'<div class="field-value">{_print_value(value)}</div></div>'
+        for label, value in fields
+    )
+
+
+def _print_table(headers, rows, status_index=None, status_missing="Pending"):
+    head = "".join(f"<th>{html.escape(label, quote=True)}</th>" for label in headers)
+    body_rows = []
+    for row in rows:
+        cells = []
+        for index, value in enumerate(row):
+            rendered = (
+                _print_status(value, missing=status_missing)
+                if index == status_index else _print_value(value)
+            )
+            cells.append(f"<td>{rendered}</td>")
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+    if not body_rows:
+        body_rows.append(
+            f'<tr><td class="empty" colspan="{len(headers)}">Not recorded</td></tr>'
+        )
+    return (
+        '<div class="table-wrap"><table><thead><tr>' + head + "</tr></thead><tbody>"
+        + "".join(body_rows) + "</tbody></table></div>"
+    )
+
+
+def build_traveler_print_html(job, generated_at=None):
+    """Build the single browser-preview and paper-print source document."""
+    normalized = normalized_job(job)
+    generated_at = generated_at or datetime.now(SHOP_TIMEZONE)
+    generated_text = format_shop_timestamp(
+        generated_at.isoformat() if isinstance(generated_at, datetime) else generated_at
+    )
+    job_number = display_value(normalized.get("job_number"), "Unknown Job")
+    programming = normalized["programming"]
+    revisions = []
+    for operation in programming["operations"]:
+        revision = clean_text(operation.get("revision"))
+        if revision and revision not in revisions:
+            revisions.append(revision)
+    revision_text = ", ".join(revisions) if revisions else None
+
+    programming_rows = [
+        (
+            row.get("operation_number"), row.get("operation_type"),
+            row.get("program_name"), row.get("revision"), row.get("status"),
+            format_shop_timestamp(row.get("last_updated")), row.get("notes"),
+        )
+        for row in programming["operations"]
+    ]
+    programming_html = (
+        '<section><div class="section-heading"><h2>Programming</h2>'
+        f'{_print_status(terminal_app.status_if_missing(normalized, "programming"))}</div>'
+        f'<div class="field-grid compact">{_print_field_grid((("Programmer", programming.get("programmer")), ("Operations Required", programming.get("operation_count"))))}</div>'
+        + _print_table(
+            ("Op", "Type", "Program", "Revision", "Status", "Last Updated", "Notes"),
+            programming_rows,
+            status_index=4,
+        ) + "</section>"
+    )
+
+    cnc = normalized["cnc_machining"]
+    programming_by_number = {
+        row.get("operation_number"): row for row in programming["operations"]
+    }
+    cnc_rows = [
+        (
+            row.get("operation_number"),
+            programming_by_number.get(row.get("operation_number"), {}).get("operation_type"),
+            row.get("operator"), row.get("machine"), row.get("qty_complete"),
+            row.get("status"), format_shop_timestamp(row.get("last_updated")), row.get("notes"),
+        )
+        for row in cnc["operations"]
+    ]
+    cnc_html = (
+        '<section><div class="section-heading"><h2>CNC Machining</h2>'
+        f'{_print_status(terminal_app.status_if_missing(normalized, "cnc_machining"))}</div>'
+        + _print_table(
+            ("Op", "Type", "Operator", "Machine", "Qty", "Status", "Last Updated", "Notes"),
+            cnc_rows,
+            status_index=5,
+        ) + "</section>"
+    )
+
+    simple_specs = (
+        ("Saw Cutting", "saw_cutting", (("Employee", "employee"), ("Quantity Cut", "qty_cut"),
+         ("Cut Length", "cut_length"), ("Scrap Quantity", "scrap_qty"),
+         ("Last Updated", "last_updated"), ("Notes", "notes"))),
+        ("Deburr", "deburr", (("Employee", "employee"), ("Deburr Needed", "deburr_needed"),
+         ("Quantity Deburred", "qty_deburred"), ("Last Updated", "last_updated"), ("Notes", "notes"))),
+        ("Packing", "packing", (("Employee", "employee"), ("Quantity Packed", "qty_packed"),
+         ("Box Count", "box_count"), ("Last Updated", "last_updated"), ("Notes", "notes"))),
+        ("Shipping", "shipping", (("Employee", "employee"), ("Ship Date", "ship_date"),
+         ("Carrier", "carrier"), ("Tracking", "tracking"),
+         ("Last Updated", "last_updated"), ("Notes", "notes"))),
+    )
+    simple_html = {}
+    for title, key, specs in simple_specs:
+        section = normalized[key]
+        fields = tuple(
+            (
+                label,
+                format_shop_timestamp(section.get(field))
+                if field == "last_updated"
+                else format_shop_date(section.get(field))
+                if field == "ship_date"
+                else section.get(field),
+            )
+            for label, field in specs
+        )
+        simple_html[key] = (
+            '<section><div class="section-heading">'
+            f"<h2>{html.escape(title)}</h2>"
+            f'{_print_status(terminal_app.status_if_missing(normalized, key))}</div>'
+            f'<div class="field-grid">{_print_field_grid(fields)}</div></section>'
+        )
+
+    inspection = normalized["inspection"]
+    inspection_parts = [
+        '<section><div class="section-heading"><h2>Inspection</h2>',
+        _print_status(terminal_app.status_if_missing(normalized, "inspection")),
+        "</div>",
+    ]
+    records = inspection.get("records", [])
+    if not records:
+        inspection_parts.append('<p class="empty">Not recorded</p>')
+    for record in records:
+        inspection_parts.append(
+            '<div class="inspection-record"><h3>Operation '
+            f'{_print_value(record.get("operation_number"))}</h3><div class="field-grid">'
+            + _print_field_grid(
+                (("Operation Type", record.get("operation_type")), ("Machine", record.get("machine")),
+                 ("Inspector", record.get("inspector")), ("Report Type", record.get("report_type")),
+                 ("Status", record.get("status")),
+                 ("Last Updated", format_shop_timestamp(record.get("last_updated"))),
+                 ("Notes", record.get("notes")))
+            ) + "</div>"
+        )
+        dimensions = []
+        for dimension in record.get("dimensions", []):
+            if isinstance(dimension, dict):
+                dimensions.append(
+                    (dimension.get("dimension_number"), dimension.get("target_dimension"),
+                     dimension.get("tolerance"), dimension.get("finding"),
+                     dimension.get("measurement_equipment_used", dimension.get("tool_used")),
+                     dimension.get("result"))
+                )
+        inspection_parts.append(
+            _print_table(
+                ("Dim", "Target", "Tolerance", "Finding", "Equipment", "Result"),
+                dimensions,
+                status_index=5,
+                status_missing="Not recorded",
+            ) + "</div>"
+        )
+    inspection_parts.append("</section>")
+
+    summary = _print_field_grid(
+        (("Job Number", normalized.get("job_number")), ("Customer", normalized.get("customer")),
+         ("Part Number", normalized.get("part_number")), ("Description", normalized.get("description")),
+         ("Quantity to Make", normalized.get("qty_to_make")), ("Material", normalized.get("material")),
+         ("Cut Length", normalized.get("cut_length")), ("Revision", revision_text),
+         ("Generated", generated_text)))
+    document_title = html.escape(f"Job Traveler {job_number}", quote=True)
+    company = html.escape(REPORT_COMPANY_NAME, quote=True)
+    return f'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{document_title}</title>
+<style>
+  @page {{ size: Letter; margin: 0.55in; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; background: #17191f; color: #111; font: 10pt "Segoe UI", Arial, sans-serif; }}
+  .toolbar {{ position: sticky; top: 0; z-index: 2; display: flex; gap: 10px; justify-content: center; padding: 12px; background: #11141b; border-bottom: 1px solid #30343d; }}
+  .toolbar button {{ border: 1px solid #4b505c; background: #272b35; color: #fff; padding: 8px 18px; font: 600 10pt "Segoe UI", Arial, sans-serif; cursor: pointer; }}
+  .toolbar .print {{ background: #2962ff; border-color: #2962ff; }}
+  .sheet {{ width: 8.5in; min-height: 11in; margin: 24px auto; padding: 0.55in; background: #fff; box-shadow: 0 2px 18px rgba(0,0,0,.45); }}
+  .report-header {{ display: flex; justify-content: space-between; gap: 20px; align-items: end; padding-bottom: 10px; border-bottom: 2px solid #111; }}
+  .company {{ color: #555; font-size: 9pt; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }}
+  h1 {{ margin: 2px 0 0; font-size: 21pt; letter-spacing: .04em; }}
+  .job-mark {{ text-align: right; font-size: 11pt; font-weight: 700; }}
+  .field-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px 16px; margin: 10px 0; }}
+  .field-grid.compact {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .field {{ min-width: 0; }}
+  .field-label {{ color: #555; font-size: 7.5pt; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }}
+  .field-value {{ margin-top: 2px; overflow-wrap: anywhere; white-space: pre-wrap; }}
+  section {{ margin-top: 14px; break-inside: auto; }}
+  .section-heading {{ display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 5px 7px; background: #e7e7e7; border: 1px solid #777; break-after: avoid; }}
+  h2 {{ margin: 0; font-size: 11pt; text-transform: uppercase; letter-spacing: .04em; }}
+  h3 {{ margin: 10px 0 5px; font-size: 9.5pt; break-after: avoid; }}
+  .status {{ display: inline-block; border: 1px solid #555; padding: 1px 5px; font-size: 7.5pt; font-weight: 700; text-transform: uppercase; white-space: nowrap; }}
+  .status-completed {{ background: #ddd; }}
+  .status-progress {{ background: #eee; border-style: double; }}
+  .status-pending {{ background: #fff; border-style: dashed; }}
+  .status-failed {{ background: #222; color: #fff; border-color: #000; }}
+  .table-wrap {{ width: 100%; overflow: visible; }}
+  table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 8pt; }}
+  thead {{ display: table-header-group; }}
+  th {{ background: #ededed; font-weight: 700; text-align: left; }}
+  th, td {{ border: 1px solid #888; padding: 4px 5px; vertical-align: top; overflow-wrap: anywhere; white-space: pre-wrap; }}
+  tr {{ break-inside: avoid; page-break-inside: avoid; }}
+  .inspection-record {{ break-inside: auto; }}
+  .empty {{ color: #666; font-style: italic; text-align: center; }}
+  @media print {{
+    html, body {{ background: #fff !important; }}
+    .toolbar {{ display: none !important; }}
+    .sheet {{ width: auto; min-height: auto; margin: 0; padding: 0; box-shadow: none; }}
+    section, table {{ orphans: 2; widows: 2; }}
+  }}
+</style>
+</head>
+<body>
+<div class="toolbar" aria-label="Print preview controls">
+  <button class="print" type="button" onclick="window.print()">Print Report</button>
+  <button type="button" onclick="window.close()">Close</button>
+</div>
+<main class="sheet">
+  <header class="report-header"><div><div class="company">{company}</div><h1>JOB TRAVELER</h1></div><div class="job-mark">Job {_print_value(normalized.get("job_number"))}<br>{_print_status(current_job_status(normalized))}</div></header>
+  <div class="field-grid">{summary}</div>
+  {programming_html}
+  {simple_html["saw_cutting"]}
+  {cnc_html}
+  {simple_html["deburr"]}
+  {''.join(inspection_parts)}
+  {simple_html["packing"]}
+  {simple_html["shipping"]}
+</main>
+</body>
+</html>'''
+
+
+def write_traveler_print_preview(job, directory=None, generated_at=None):
+    """Write a browser-safe temporary preview without modifying traveler JSON."""
+    job_number = re.sub(
+        r"[^A-Za-z0-9_.-]+", "-", display_value(job.get("job_number"), "job")
+    )[:80] or "job"
+    destination_directory = Path(directory) if directory is not None else Path(tempfile.gettempdir())
+    destination_directory.mkdir(parents=True, exist_ok=True)
+    destination = destination_directory / f"Job-Traveler-{job_number}.html"
+    destination.write_text(
+        build_traveler_print_html(job, generated_at=generated_at), encoding="utf-8"
+    )
+    return destination
 
 
 class ValidationError(ValueError):
@@ -579,9 +955,11 @@ class ScrollableFrame(ttk.Frame):
 
     def __init__(self, parent):
         super().__init__(parent)
-        self.canvas = tk.Canvas(self, highlightthickness=0, background="#f4f6f8")
+        self.canvas = tk.Canvas(self, highlightthickness=0, background=BACKGROUND)
         scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.content = ttk.Frame(self.canvas, style="App.TFrame", padding=(28, 18))
+        self.content = ttk.Frame(
+            self.canvas, style="App.TFrame", padding=(SPACE_SECTION, SPACE_GROUP)
+        )
         self.window_id = self.canvas.create_window(
             (0, 0), window=self.content, anchor="nw"
         )
@@ -622,43 +1000,17 @@ class JobTravelerApp:
         self.current_job = None
         self.current_path = None
         self.root.title(APP_TITLE)
+        # ===== CUSTOMIZE: MAIN WINDOW =====
+        # CUSTOMIZE: Geometry is width x height; minsize prevents form clipping.
         self.root.geometry("1100x760")
         self.root.minsize(900, 620)
-        self.root.configure(background="#f4f6f8")
+        self.root.configure(background=BACKGROUND)
         self.root.protocol("WM_DELETE_WINDOW", self.close_application)
         self._configure_styles()
         self.show_home()
 
     def _configure_styles(self):
-        style = ttk.Style(self.root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure("App.TFrame", background="#f4f6f8")
-        style.configure(
-            "Title.TLabel",
-            background="#f4f6f8",
-            foreground="#17324d",
-            font=("Segoe UI", 26, "bold"),
-        )
-        style.configure(
-            "Heading.TLabel",
-            background="#f4f6f8",
-            foreground="#17324d",
-            font=("Segoe UI", 17, "bold"),
-        )
-        style.configure(
-            "Subheading.TLabel",
-            background="#f4f6f8",
-            foreground="#44596d",
-            font=("Segoe UI", 10),
-        )
-        style.configure("Action.TButton", font=("Segoe UI", 11), padding=(14, 10))
-        style.configure("Section.TButton", font=("Segoe UI", 10), padding=(10, 9))
-        style.configure("Field.TLabel", font=("Segoe UI", 10, "bold"))
-        style.configure("Value.TLabel", font=("Segoe UI", 10))
-        style.configure("Status.TLabel", font=("Segoe UI", 10, "bold"))
-        style.configure("Treeview", rowheight=28, font=("Segoe UI", 10))
-        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        self.style = apply_shopos_theme(self.root)
 
     def clear_screen(self):
         for child in self.root.winfo_children():
@@ -668,17 +1020,17 @@ class JobTravelerApp:
         ttk.Label(parent, text=title, style="Heading.TLabel").pack(anchor="w")
         if subtitle:
             ttk.Label(parent, text=subtitle, style="Subheading.TLabel").pack(
-                anchor="w", pady=(4, 18)
+                anchor="w", pady=(4, SPACE_SECTION)
             )
         else:
-            ttk.Separator(parent).pack(fill="x", pady=(8, 18))
+            ttk.Separator(parent).pack(fill="x", pady=(SPACE_TIGHT, SPACE_SECTION))
 
     def close_application(self):
         self.root.destroy()
 
     def show_home(self):
         self.clear_screen()
-        frame = ttk.Frame(self.root, style="App.TFrame", padding=40)
+        frame = ttk.Frame(self.root, style="App.TFrame", padding=SPACE_SECTION)
         frame.pack(fill="both", expand=True)
         center = ttk.Frame(frame, style="App.TFrame")
         center.place(relx=0.5, rely=0.44, anchor="center")
@@ -687,19 +1039,19 @@ class JobTravelerApp:
             center,
             text="Create and manage CNC shop travelers",
             style="Subheading.TLabel",
-        ).pack(pady=(0, 28))
+        ).pack(pady=(0, SPACE_SECTION))
         ttk.Button(
             center,
             text="Create New Job",
             command=self.show_create_job,
-            style="Action.TButton",
+            style="Primary.TButton",
             width=28,
         ).pack(fill="x", pady=6)
         ttk.Button(
             center,
             text="Open Existing Job",
             command=self.show_job_list,
-            style="Action.TButton",
+            style="Primary.TButton",
             width=28,
         ).pack(fill="x", pady=6)
         ttk.Button(
@@ -720,7 +1072,7 @@ class JobTravelerApp:
             "Create New Job",
             "Required fields match the existing terminal traveler format.",
         )
-        form = ttk.LabelFrame(content, text="Job Information", padding=20)
+        form = ttk.LabelFrame(content, text="Job Information", padding=SPACE_GROUP)
         form.pack(fill="x")
         labels = (
             ("job_number", "Job Number"),
@@ -747,7 +1099,7 @@ class JobTravelerApp:
         ttk.Button(
             buttons,
             text="Create and Open Job",
-            style="Action.TButton",
+            style="Primary.TButton",
             command=lambda: self._create_job(entries),
         ).pack(side="right")
         ttk.Button(
@@ -789,7 +1141,7 @@ class JobTravelerApp:
 
     def show_job_list(self):
         self.clear_screen()
-        frame = ttk.Frame(self.root, style="App.TFrame", padding=28)
+        frame = ttk.Frame(self.root, style="App.TFrame", padding=SPACE_SECTION)
         frame.pack(fill="both", expand=True)
         self.page_header(
             frame, "Open Existing Job", f"Traveler folder: {self.jobs_directory}"
@@ -841,7 +1193,7 @@ class JobTravelerApp:
             ttk.Label(
                 frame,
                 text=f"Skipped {len(errors)} unreadable traveler file(s).",
-                foreground="#9c2f2f",
+                style="Fail.TLabel",
             ).pack(anchor="w", pady=(8, 0))
 
         def open_selected(_event=None):
@@ -866,7 +1218,7 @@ class JobTravelerApp:
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(18, 0))
         ttk.Button(
-            buttons, text="Open Selected", style="Action.TButton", command=open_selected
+            buttons, text="Open Selected", style="Primary.TButton", command=open_selected
         ).pack(side="right")
         ttk.Button(
             buttons, text="Home", style="Action.TButton", command=self.show_home
@@ -902,6 +1254,13 @@ class JobTravelerApp:
             return False
         return self._persist_candidate(copy.deepcopy(self.current_job), confirmation)
 
+    def traveler_view_actions(self):
+        """Keep screen viewing and paper preview as explicitly separate actions."""
+        return (
+            ("View Traveler", self.show_traveler_preview),
+            ("Print Traveler", self.print_traveler),
+        )
+
     def show_job_detail(self):
         if self.current_job is None:
             self.show_home()
@@ -934,7 +1293,8 @@ class JobTravelerApp:
             cell = ttk.Frame(header)
             cell.grid(row=row, column=column, sticky="ew", padx=8, pady=6)
             ttk.Label(cell, text=f"{label}:", style="Field.TLabel").pack(side="left")
-            ttk.Label(cell, text=str(value), style="Value.TLabel", wraplength=330).pack(
+            value_style = status_label_style(value) if key is None else "Value.TLabel"
+            ttk.Label(cell, text=str(value), style=value_style, wraplength=330).pack(
                 side="left", padx=(8, 0)
             )
         header.columnconfigure(0, weight=1)
@@ -950,8 +1310,7 @@ class JobTravelerApp:
             ("Inspection", self.show_inspection),
             ("Packing", lambda: self.show_standard_section("packing")),
             ("Shipping", lambda: self.show_standard_section("shipping")),
-            ("Print / View Traveler", self.show_traveler_preview),
-        )
+        ) + self.traveler_view_actions()
         for index, (label, command) in enumerate(actions):
             row, column = divmod(index, 3)
             ttk.Button(
@@ -970,10 +1329,11 @@ class JobTravelerApp:
             ttk.Label(statuses, text=f"{label}:", style="Field.TLabel").grid(
                 row=index // 4, column=(index % 4) * 2, sticky="w", padx=(6, 4), pady=5
             )
+            section_status = terminal_app.status_if_missing(self.current_job, section)
             ttk.Label(
                 statuses,
-                text=terminal_app.status_if_missing(self.current_job, section),
-                style="Status.TLabel",
+                text=section_status,
+                style=status_label_style(section_status),
             ).grid(
                 row=index // 4,
                 column=(index % 4) * 2 + 1,
@@ -987,7 +1347,7 @@ class JobTravelerApp:
         ttk.Button(
             buttons,
             text="Save",
-            style="Action.TButton",
+            style="Primary.TButton",
             command=lambda: self._persist_current("Traveler saved."),
         ).pack(side="right")
         ttk.Button(
@@ -1009,7 +1369,7 @@ class JobTravelerApp:
         section = self.current_job.get(section_name, {})
         if not isinstance(section, dict):
             section = {}
-        form = ttk.LabelFrame(content, text=title, padding=20)
+        form = ttk.LabelFrame(content, text=title, padding=SPACE_GROUP)
         form.pack(fill="x")
         widgets = {}
         for row, spec in enumerate(field_specs):
@@ -1022,7 +1382,8 @@ class JobTravelerApp:
             if current is None:
                 current = ""
             if kind == "notes":
-                widget = tk.Text(form, height=5, width=62, wrap="word", font=("Segoe UI", 10))
+                widget = tk.Text(form, height=5, width=62, wrap="word")
+                style_text_widget(widget)
                 widget.insert("1.0", str(current))
             elif kind == "combo":
                 widget = ttk.Combobox(form, values=options, state="readonly", width=58)
@@ -1062,7 +1423,7 @@ class JobTravelerApp:
         buttons = ttk.Frame(content)
         buttons.pack(fill="x", pady=(20, 0))
         ttk.Button(
-            buttons, text="Save Section", style="Action.TButton", command=save_section
+            buttons, text="Save Section", style="Primary.TButton", command=save_section
         ).pack(side="right")
         ttk.Button(
             buttons,
@@ -1083,7 +1444,7 @@ class JobTravelerApp:
         )
         normalized = normalized_job(self.current_job)
         programming = normalized["programming"]
-        form = ttk.LabelFrame(content, text="Programming", padding=20)
+        form = ttk.LabelFrame(content, text="Programming", padding=SPACE_GROUP)
         form.pack(fill="x")
         ttk.Label(form, text="Programmer Name:", style="Field.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 16), pady=7
@@ -1149,8 +1510,8 @@ class JobTravelerApp:
                             height=3,
                             width=59,
                             wrap="word",
-                            font=("Segoe UI", 10),
                         )
+                        style_text_widget(widget)
                         widget.insert("1.0", str(saved.get(key, "")))
                     else:
                         widget = ttk.Entry(card, width=59)
@@ -1220,7 +1581,7 @@ class JobTravelerApp:
         buttons = ttk.Frame(content)
         buttons.pack(fill="x", pady=(20, 0))
         ttk.Button(
-            buttons, text="Save Section", style="Action.TButton", command=save_section
+            buttons, text="Save Section", style="Primary.TButton", command=save_section
         ).pack(side="right")
         ttk.Button(
             buttons,
@@ -1298,7 +1659,7 @@ class JobTravelerApp:
         programming_operations = normalized["programming"]["operations"]
         cnc_operations = normalized["cnc_machining"]["operations"]
 
-        form = ttk.LabelFrame(frame, text="CNC Workflow", padding=20)
+        form = ttk.LabelFrame(frame, text="CNC Workflow", padding=SPACE_GROUP)
         form.pack(fill="x")
         ttk.Label(form, text="Operation:", style="Field.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 16), pady=8
@@ -1350,7 +1711,8 @@ class JobTravelerApp:
         ttk.Label(form, text="Notes:", style="Field.TLabel").grid(
             row=7, column=0, sticky="nw", padx=(0, 16), pady=8
         )
-        notes = tk.Text(form, height=4, width=60, wrap="word", font=("Segoe UI", 10))
+        notes = tk.Text(form, height=4, width=60, wrap="word")
+        style_text_widget(notes)
         notes.grid(row=7, column=1, sticky="ew", pady=8)
         form.columnconfigure(1, weight=1)
 
@@ -1377,7 +1739,10 @@ class JobTravelerApp:
             operator.insert(0, str(saved.get("operator", "")))
             quantity.delete(0, "end")
             quantity.insert(0, str(saved.get("qty_complete", 0)))
-            status_value.configure(text=saved.get("status", "Pending"))
+            saved_status = saved.get("status", "Pending")
+            status_value.configure(
+                text=saved_status, style=status_label_style(saved_status)
+            )
             notes.delete("1.0", "end")
             notes.insert("1.0", str(saved.get("notes", "")))
 
@@ -1411,7 +1776,7 @@ class JobTravelerApp:
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(20, 0))
         ttk.Button(
-            buttons, text="Save Section", style="Action.TButton", command=save_section
+            buttons, text="Save Section", style="Primary.TButton", command=save_section
         ).pack(side="right")
         ttk.Button(
             buttons,
@@ -1434,7 +1799,7 @@ class JobTravelerApp:
         programming_operations = normalized["programming"]["operations"]
         cnc_operations = normalized["cnc_machining"]["operations"]
         inspection_records = normalized["inspection"]["records"]
-        form = ttk.LabelFrame(content, text="Inspection Header", padding=20)
+        form = ttk.LabelFrame(content, text="Inspection Header", padding=SPACE_GROUP)
         form.pack(fill="x")
 
         ttk.Label(form, text="Operation:", style="Field.TLabel").grid(
@@ -1461,7 +1826,7 @@ class JobTravelerApp:
         )
         machine_value = ttk.Label(form, text="", style="Value.TLabel")
         machine_value.grid(row=2, column=1, sticky="w", pady=7)
-        warning_value = ttk.Label(form, text="", foreground="#a33a2b")
+        warning_value = ttk.Label(form, text="", style="Warning.TLabel")
         warning_value.grid(row=3, column=1, sticky="w", pady=(0, 7))
         ttk.Label(form, text="Inspector:", style="Field.TLabel").grid(
             row=4, column=0, sticky="w", padx=(0, 16), pady=7
@@ -1483,7 +1848,8 @@ class JobTravelerApp:
         ttk.Label(form, text="Notes:", style="Field.TLabel").grid(
             row=7, column=0, sticky="nw", padx=(0, 16), pady=7
         )
-        notes = tk.Text(form, height=6, width=60, wrap="word", font=("Segoe UI", 10))
+        notes = tk.Text(form, height=6, width=60, wrap="word")
+        style_text_widget(notes)
         notes.grid(row=7, column=1, sticky="ew", pady=7)
         form.columnconfigure(1, weight=1)
 
@@ -1558,12 +1924,12 @@ class JobTravelerApp:
         buttons = ttk.Frame(content)
         buttons.pack(fill="x", pady=(20, 0))
         ttk.Button(
-            buttons, text="Save Section", style="Action.TButton", command=save_section
+            buttons, text="Save Section", style="Primary.TButton", command=save_section
         ).pack(side="right")
         ttk.Button(
             buttons,
             text="Save & Edit Dimensions",
-            style="Action.TButton",
+            style="Primary.TButton",
             command=save_and_open_dimensions,
         ).pack(side="right", padx=(0, 10))
         ttk.Button(
@@ -1607,6 +1973,8 @@ class JobTravelerApp:
         table_frame.pack(fill="both", expand=True)
         columns = ("number", "target", "tolerance", "finding", "equipment", "result")
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+        tree.tag_configure("pass", foreground=PASS)
+        tree.tag_configure("rejected", foreground=FAIL)
         labels = ("Dim", "Target", "Tolerance", "Finding", "Equipment", "Result")
         widths = (55, 145, 130, 145, 210, 100)
         for key, label, width in zip(columns, labels, widths):
@@ -1625,6 +1993,8 @@ class JobTravelerApp:
                 equipment = row.get(
                     "measurement_equipment_used", row.get("tool_used", "")
                 )
+                result_value = row.get("result", "")
+                result_tag = clean_text(result_value).casefold()
                 tree.insert(
                     "",
                     "end",
@@ -1635,8 +2005,9 @@ class JobTravelerApp:
                         row.get("tolerance", ""),
                         row.get("finding", ""),
                         equipment,
-                        row.get("result", ""),
+                        result_value,
                     ),
+                    tags=(result_tag,) if result_tag in {"pass", "rejected"} else (),
                 )
 
         refresh_table()
@@ -1704,10 +2075,16 @@ class JobTravelerApp:
         dimension_buttons = ttk.Frame(add_frame)
         dimension_buttons.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(
-            dimension_buttons, text="Add Dimension", command=add_dimension
+            dimension_buttons,
+            text="Add Dimension",
+            style="Primary.TButton",
+            command=add_dimension,
         ).pack(side="left")
         ttk.Button(
-            dimension_buttons, text="Remove Selected", command=remove_selected
+            dimension_buttons,
+            text="Remove Selected",
+            style="Danger.TButton",
+            command=remove_selected,
         ).pack(side="left", padx=(10, 0))
 
         def save_dimensions():
@@ -1721,7 +2098,7 @@ class JobTravelerApp:
         ttk.Button(
             buttons,
             text="Save Inspection",
-            style="Action.TButton",
+            style="Primary.TButton",
             command=save_dimensions,
         ).pack(side="right")
         ttk.Button(
@@ -1731,27 +2108,298 @@ class JobTravelerApp:
             command=self.show_job_detail,
         ).pack(side="right", padx=(0, 10))
 
-    def show_traveler_preview(self):
-        self.clear_screen()
-        frame = ttk.Frame(self.root, style="App.TFrame", padding=24)
-        frame.pack(fill="both", expand=True)
-        self.page_header(frame, "Print / View Traveler", "Public traveler preview")
-        preview = scrolledtext.ScrolledText(
-            frame,
-            wrap="none",
-            font=("Consolas", 10),
-            padx=12,
-            pady=12,
+    def _preview_panel(self, parent, title, status):
+        """Create one dense traveler department panel."""
+        panel = ttk.Frame(parent, style="Panel.TFrame", padding=SPACE_GROUP)
+        panel.pack(fill="x", pady=(0, SPACE_CONTROL))
+        heading = ttk.Frame(panel, style="Surface.TFrame")
+        heading.pack(fill="x", pady=(0, SPACE_CONTROL))
+        ttk.Label(heading, text=title, style="PanelTitle.TLabel").pack(side="left")
+        ttk.Label(
+            heading, text=display_value(status, "Pending"), style=status_badge_style(status)
+        ).pack(side="right")
+        return panel
+
+    def _preview_fields(self, parent, fields, columns=2):
+        """Render label/value pairs with wrapping for long traveler content."""
+        grid = ttk.Frame(parent, style="Surface.TFrame")
+        grid.pack(fill="x")
+        for index, (label, value) in enumerate(fields):
+            row, column = divmod(index, columns)
+            cell = ttk.Frame(grid, style="Surface.TFrame", padding=(0, 0, SPACE_GROUP, SPACE_CONTROL))
+            cell.grid(row=row, column=column, sticky="nsew")
+            ttk.Label(cell, text=label.upper(), style="PanelHeading.TLabel").pack(anchor="w")
+            shown = display_value(value)
+            ttk.Label(
+                cell,
+                text=shown,
+                style="Muted.TLabel" if shown == "—" else "Value.TLabel",
+                wraplength=430,
+                justify="left",
+            ).pack(anchor="w", pady=(3, 0))
+        for column in range(columns):
+            grid.columnconfigure(column, weight=1, uniform="preview_fields")
+        return grid
+
+    def _enable_tree_hover(self, tree):
+        """Highlight the table row beneath the pointer without changing selection."""
+        tree.tag_configure("hover", background=BORDER)
+        hovered = {"item": None}
+
+        def move(event):
+            item = tree.identify_row(event.y)
+            if item == hovered["item"]:
+                return
+            if hovered["item"] and tree.exists(hovered["item"]):
+                tags = tuple(tag for tag in tree.item(hovered["item"], "tags") if tag != "hover")
+                tree.item(hovered["item"], tags=tags)
+            hovered["item"] = item or None
+            if item:
+                tree.item(item, tags=(*tree.item(item, "tags"), "hover"))
+
+        def leave(_event=None):
+            if hovered["item"] and tree.exists(hovered["item"]):
+                tags = tuple(tag for tag in tree.item(hovered["item"], "tags") if tag != "hover")
+                tree.item(hovered["item"], tags=tags)
+            hovered["item"] = None
+
+        tree.bind("<Motion>", move, add="+")
+        tree.bind("<Leave>", leave, add="+")
+
+    def _preview_table(self, parent, columns, rows, *, status_index=None, horizontal=True):
+        """Render structured rows in a keyboard-focusable ttk table."""
+        table_frame = ttk.Frame(parent, style="Surface.TFrame")
+        table_frame.pack(fill="x", pady=(SPACE_TIGHT, 0))
+        keys = tuple(f"column_{index}" for index in range(len(columns)))
+        # ===== CUSTOMIZE: PREVIEW TABLES =====
+        # CUSTOMIZE: PREVIEW_TABLE_HEIGHT controls visible rows before page scrolling.
+        tree = ttk.Treeview(
+            table_frame,
+            columns=keys,
+            show="headings",
+            height=max(1, min(PREVIEW_TABLE_HEIGHT, len(rows) or 1)),
+            selectmode="browse",
         )
-        preview.pack(fill="both", expand=True)
-        preview.insert("1.0", traveler_text(self.current_job))
-        preview.configure(state="disabled")
+        for key, (heading, width) in zip(keys, columns):
+            tree.heading(key, text=heading)
+            tree.column(key, width=width, minwidth=60, stretch=heading in {"Notes", "Description"})
+        tree.tag_configure("completed", foreground=PASS)
+        tree.tag_configure("failed", foreground=FAIL)
+        tree.tag_configure("pending", foreground=MUTED_TEXT)
+        tree.tag_configure("progress", foreground="#D1D4DC")
+        for raw_row in rows:
+            shown = tuple(display_value(value) for value in raw_row)
+            tags = ()
+            if status_index is not None and status_index < len(raw_row):
+                status = clean_text(raw_row[status_index]).casefold()
+                if status in {"completed", "pass", "passed"}:
+                    tags = ("completed",)
+                elif status in {"failed", "fail", "rejected", "blocked"}:
+                    tags = ("failed",)
+                elif status == "in progress":
+                    tags = ("progress",)
+                else:
+                    tags = ("pending",)
+            tree.insert("", "end", values=shown, tags=tags)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        vertical.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=vertical.set)
+        if horizontal:
+            horizontal_bar = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+            horizontal_bar.grid(row=1, column=0, sticky="ew")
+            tree.configure(xscrollcommand=horizontal_bar.set)
+        table_frame.columnconfigure(0, weight=1)
+        self._enable_tree_hover(tree)
+        return tree
+
+    def show_traveler_preview(self):
+        """Render the traveler from structured data; printing still uses traveler_text()."""
+        self.clear_screen()
+        normalized = normalized_job(self.current_job)
+        scroll = ScrollableFrame(self.root)
+        scroll.pack(fill="both", expand=True)
+        content = scroll.content
+
+        # ===== CUSTOMIZE: TRAVELER HEADER =====
+        # CUSTOMIZE: Header padding and spacing control the preview's overall density.
+        header = ttk.Frame(content, style="Panel.TFrame", padding=SPACE_GROUP)
+        header.pack(fill="x", pady=(0, SPACE_CONTROL))
+        title_row = ttk.Frame(header, style="Surface.TFrame")
+        title_row.pack(fill="x")
+        ttk.Label(title_row, text="JOB TRAVELER", style="PanelTitle.TLabel").pack(side="left")
+        overall_status = current_job_status(normalized)
+        ttk.Label(
+            title_row, text=overall_status, style=status_badge_style(overall_status)
+        ).pack(side="right")
+        ttk.Label(
+            header,
+            text=f"JOB {display_value(normalized.get('job_number'))}",
+            style="PreviewTitle.TLabel",
+        ).pack(anchor="w", pady=(SPACE_CONTROL, 2))
+        ttk.Label(
+            header,
+            text=f"Part {display_value(normalized.get('part_number'))}",
+            style="PreviewSubtitle.TLabel",
+        ).pack(anchor="w")
+        self._preview_fields(
+            header,
+            (
+                ("Customer", normalized.get("customer")),
+                ("Description", normalized.get("description")),
+                ("Quantity", normalized.get("qty_to_make")),
+                ("Material", normalized.get("material")),
+                ("Cut Length", normalized.get("cut_length")),
+            ),
+        )
+
+        programming = normalized["programming"]
+        panel = self._preview_panel(
+            content, "Programming", terminal_app.status_if_missing(normalized, "programming")
+        )
+        self._preview_fields(
+            panel,
+            (("Programmer", programming.get("programmer")),
+             ("Operations Required", programming.get("operation_count"))),
+        )
+        programming_rows = [
+            (
+                row.get("operation_number"), row.get("operation_type"),
+                row.get("program_name"), row.get("revision"), row.get("status"),
+                format_shop_timestamp(row.get("last_updated")), row.get("notes"),
+            )
+            for row in programming["operations"]
+        ]
+        self._preview_table(
+            panel,
+            (("Op", 60), ("Type", 100), ("Program", 150), ("Rev", 70),
+             ("Status", 110), ("Updated", 210), ("Notes", 260)),
+            programming_rows,
+            status_index=4,
+        )
+
+        simple_sections = (
+            ("Saw Cutting", "saw_cutting", (("Employee", "employee"), ("Quantity Cut", "qty_cut"),
+             ("Cut Length", "cut_length"), ("Scrap Quantity", "scrap_qty"),
+             ("Last Updated", "last_updated"), ("Notes", "notes"))),
+            ("Deburr", "deburr", (("Employee", "employee"), ("Deburr Needed", "deburr_needed"),
+             ("Quantity Deburred", "qty_deburred"), ("Last Updated", "last_updated"),
+             ("Notes", "notes"))),
+            ("Packing", "packing", (("Employee", "employee"), ("Quantity Packed", "qty_packed"),
+             ("Box Count", "box_count"), ("Last Updated", "last_updated"), ("Notes", "notes"))),
+            ("Shipping", "shipping", (("Employee", "employee"), ("Ship Date", "ship_date"),
+             ("Carrier", "carrier"), ("Tracking", "tracking"),
+             ("Last Updated", "last_updated"), ("Notes", "notes"))),
+        )
+        for title, key, field_specs in simple_sections[:1]:
+            section = normalized[key]
+            panel = self._preview_panel(content, title, terminal_app.status_if_missing(normalized, key))
+            self._preview_fields(panel, tuple(
+                (label, format_shop_timestamp(section.get(field)) if field == "last_updated" else section.get(field))
+                for label, field in field_specs
+            ))
+
+        cnc = normalized["cnc_machining"]
+        panel = self._preview_panel(
+            content, "CNC Machining", terminal_app.status_if_missing(normalized, "cnc_machining")
+        )
+        programming_by_number = {
+            row.get("operation_number"): row for row in programming["operations"]
+        }
+        cnc_rows = [
+            (
+                row.get("operation_number"),
+                programming_by_number.get(row.get("operation_number"), {}).get("operation_type"),
+                row.get("operator"), row.get("machine"), row.get("qty_complete"),
+                row.get("status"), format_shop_timestamp(row.get("last_updated")), row.get("notes"),
+            )
+            for row in cnc["operations"]
+        ]
+        self._preview_table(
+            panel,
+            (("Op", 60), ("Type", 90), ("Operator", 130), ("Machine", 170),
+             ("Qty", 75), ("Status", 110), ("Updated", 210), ("Notes", 250)),
+            cnc_rows,
+            status_index=5,
+        )
+
+        for title, key, field_specs in simple_sections[1:2]:
+            section = normalized[key]
+            panel = self._preview_panel(content, title, terminal_app.status_if_missing(normalized, key))
+            self._preview_fields(panel, tuple(
+                (label, format_shop_timestamp(section.get(field)) if field == "last_updated" else section.get(field))
+                for label, field in field_specs
+            ))
+
+        inspection = normalized["inspection"]
+        panel = self._preview_panel(
+            content, "Inspection", terminal_app.status_if_missing(normalized, "inspection")
+        )
+        records = inspection.get("records", [])
+        if not records:
+            ttk.Label(panel, text="No inspection recorded", style="Muted.TLabel").pack(anchor="w")
+        for record_index, record in enumerate(records):
+            if record_index:
+                ttk.Separator(panel).pack(fill="x", pady=SPACE_CONTROL)
+            self._preview_fields(
+                panel,
+                (("Operation", record.get("operation_number")),
+                 ("Operation Type", record.get("operation_type")),
+                 ("Machine", record.get("machine")), ("Inspector", record.get("inspector")),
+                 ("Report Type", record.get("report_type")), ("Status", record.get("status")),
+                 ("Last Updated", format_shop_timestamp(record.get("last_updated"))),
+                 ("Notes", record.get("notes"))),
+            )
+            dimension_rows = []
+            for dimension in record.get("dimensions", []):
+                if not isinstance(dimension, dict):
+                    continue
+                dimension_rows.append(
+                    (dimension.get("dimension_number"), dimension.get("target_dimension"),
+                     dimension.get("tolerance"), dimension.get("finding"),
+                     dimension.get("measurement_equipment_used", dimension.get("tool_used")),
+                     dimension.get("result"))
+                )
+            if dimension_rows:
+                self._preview_table(
+                    panel,
+                    (("Dim", 60), ("Target", 130), ("Tolerance", 130),
+                     ("Finding", 130), ("Equipment", 190), ("Result", 100)),
+                    dimension_rows,
+                    status_index=5,
+                    horizontal=False,
+                )
+
+        for title, key, field_specs in simple_sections[2:]:
+            section = normalized[key]
+            panel = self._preview_panel(content, title, terminal_app.status_if_missing(normalized, key))
+            self._preview_fields(panel, tuple(
+                (label, format_shop_timestamp(section.get(field)) if field == "last_updated" else section.get(field))
+                for label, field in field_specs
+            ))
+
         ttk.Button(
-            frame,
+            content,
             text="Return to Job",
             style="Action.TButton",
             command=self.show_job_detail,
-        ).pack(anchor="e", pady=(16, 0))
+        ).pack(anchor="e", pady=(SPACE_TIGHT, SPACE_SECTION))
+
+    def print_traveler(self):
+        """Open the exact paper source in the default browser for preview/printing."""
+        if self.current_job is None:
+            return
+        try:
+            preview_path = write_traveler_print_preview(self.current_job)
+            opened = webbrowser.open_new_tab(preview_path.resolve().as_uri())
+            if not opened:
+                raise OSError("The default browser did not accept the print preview.")
+        except (OSError, TypeError, ValueError) as error:
+            messagebox.showerror(
+                "Print Preview Error",
+                f"Could not open the traveler print preview:\n\n{error}",
+                parent=self.root,
+            )
 
 
 def main():

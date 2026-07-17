@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import inspect
 import io
 import json
 import subprocess
@@ -9,11 +10,14 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest import mock
 
 import job_traveler as terminal_app
 import job_traveler_gui as gui
+import gui_theme
 
 
 class MultiOperationTravelerTests(unittest.TestCase):
@@ -233,6 +237,126 @@ class MultiOperationTravelerTests(unittest.TestCase):
         self.assertIn("OP | TYPE | OPERATOR | MACHINE", text)
         self.assertNotIn("First Article:", text)
 
+    def test_structured_preview_does_not_render_terminal_text_widget(self):
+        source = inspect.getsource(gui.JobTravelerApp.show_traveler_preview)
+        self.assertNotIn("ScrolledText", source)
+        self.assertNotIn("preview.insert", source)
+        self.assertIn("_preview_table", source)
+        # The independent print/export generator intentionally remains unchanged.
+        self.assertIn("OP | TYPE | PROGRAM", gui.traveler_text(self.programmed_job()))
+
+    def test_view_and_print_buttons_call_distinct_actions(self):
+        app = object.__new__(gui.JobTravelerApp)
+        app.show_traveler_preview = mock.Mock()
+        app.print_traveler = mock.Mock()
+        actions = dict(app.traveler_view_actions())
+        self.assertEqual(set(actions), {"View Traveler", "Print Traveler"})
+        actions["View Traveler"]()
+        app.show_traveler_preview.assert_called_once_with()
+        app.print_traveler.assert_not_called()
+        actions["Print Traveler"]()
+        app.print_traveler.assert_called_once_with()
+
+    def test_print_preview_is_escaped_letter_html_with_nonprinting_toolbar(self):
+        job = self.programmed_job()
+        job["customer"] = '<script>alert("customer")</script>'
+        job["description"] = "A very long description " * 40
+        job["programming"]["operations"][0]["notes"] = "<b>not markup</b>"
+        generated = datetime(2026, 7, 16, 5, 24, tzinfo=timezone.utc)
+        report = gui.build_traveler_print_html(job, generated_at=generated)
+        parser = HTMLParser()
+        parser.feed(report)
+        parser.close()
+        self.assertTrue(report.startswith("<!doctype html>"))
+        self.assertIn("<title>Job Traveler MULTI-OP-001</title>", report)
+        self.assertNotIn('<script>alert("customer")</script>', report)
+        self.assertIn("&lt;script&gt;alert(&quot;customer&quot;)&lt;/script&gt;", report)
+        self.assertIn("&lt;b&gt;not markup&lt;/b&gt;", report)
+        self.assertIn("@page { size: Letter;", report)
+        self.assertIn("@media print", report)
+        self.assertIn(".toolbar { display: none !important; }", report)
+        self.assertIn('onclick="window.print()"', report)
+        self.assertIn('onclick="window.close()"', report)
+        self.assertIn("Jul 16, 2026 at 1:24 AM EDT", report)
+
+    def test_print_report_contains_every_section_and_handles_missing_values(self):
+        report = gui.build_traveler_print_html(
+            self.new_job(), generated_at="2026-07-16T05:24:00+00:00"
+        )
+        for section in (
+            "Programming", "Saw Cutting", "CNC Machining", "Deburr",
+            "Inspection", "Packing", "Shipping",
+        ):
+            self.assertIn(f">{section}<", report)
+        self.assertIn("Not recorded", report)
+        self.assertNotIn(terminal_app.BLANK, report)
+        self.assertIn("thead { display: table-header-group; }", report)
+        self.assertIn("page-break-inside: avoid", report)
+
+    def test_print_action_opens_generated_html_in_default_browser(self):
+        app = object.__new__(gui.JobTravelerApp)
+        app.current_job = self.new_job()
+        app.root = mock.Mock()
+        preview = Path(tempfile.gettempdir()) / "Job-Traveler-test.html"
+        with mock.patch.object(
+            gui, "write_traveler_print_preview", return_value=preview
+        ) as write_preview, mock.patch.object(
+            gui.webbrowser, "open_new_tab", return_value=True
+        ) as open_tab:
+            app.print_traveler()
+        write_preview.assert_called_once_with(app.current_job)
+        open_tab.assert_called_once_with(preview.resolve().as_uri())
+
+    def test_print_file_generation_does_not_change_job_or_text_export(self):
+        job = self.programmed_job()
+        before = copy.deepcopy(job)
+        text_before = gui.traveler_text(job)
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as directory:
+            path = gui.write_traveler_print_preview(
+                job, directory=directory, generated_at="2026-07-16T05:24:00+00:00"
+            )
+            self.assertEqual(path.suffix, ".html")
+            self.assertIn("JOB TRAVELER", path.read_text(encoding="utf-8"))
+        self.assertEqual(job, before)
+        self.assertEqual(gui.traveler_text(job), text_before)
+
+    def test_preview_timestamp_formats_utc_and_legacy_florida_time(self):
+        self.assertEqual(
+            gui.format_shop_timestamp("2026-07-16T05:24:00+00:00"),
+            "Jul 16, 2026 at 1:24 AM EDT",
+        )
+        self.assertEqual(
+            gui.format_shop_timestamp("2026-07-16 01:24"),
+            "Jul 16, 2026 at 1:24 AM EDT",
+        )
+        self.assertEqual(
+            gui.format_shop_timestamp("2026-01-16T06:24:00Z"),
+            "Jan 16, 2026 at 1:24 AM EST",
+        )
+        self.assertEqual(gui.format_shop_timestamp("not-a-time"), "—")
+        self.assertEqual(gui.format_shop_date("2026-07-16"), "Jul 16, 2026")
+        self.assertEqual(gui.format_shop_date("July 16"), "July 16")
+
+    def test_tradingview_preview_palette_and_missing_value(self):
+        self.assertEqual(gui_theme.BACKGROUND, "#000000")
+        self.assertEqual(gui_theme.SURFACE, "#131722")
+        self.assertEqual(gui_theme.RAISED_SURFACE, "#1E222D")
+        self.assertEqual(gui_theme.SELECTION, "#2962FF")
+        self.assertEqual(gui.display_value(terminal_app.BLANK), "—")
+
+    def test_job_777_normalizes_for_structured_preview_without_rewrite(self):
+        path = self.repository / "jobs" / "777.json"
+        before = path.read_bytes()
+        job = gui.load_job_path(path)
+        self.assertEqual(job["job_number"], "777")
+        self.assertEqual(len(job["programming"]["operations"]), 1)
+        self.assertEqual(len(job["inspection"]["records"]), 1)
+        self.assertEqual(
+            gui.format_shop_timestamp(job["inspection"]["records"][0]["last_updated"]),
+            "Jul 3, 2026 at 4:49 AM EDT",
+        )
+        self.assertEqual(path.read_bytes(), before)
+
     def test_cnc_status_is_derived_per_operation(self):
         job = self.programmed_job()
         first = self.cnc_update(job, 1, terminal_app.MILLING_MACHINES[2], 20)
@@ -384,7 +508,7 @@ class MultiOperationTravelerTests(unittest.TestCase):
     def test_save_and_reopen_normalized_job(self):
         job = self.programmed_job()
         self.cnc_update(job, 1, terminal_app.MILLING_MACHINES[0], 20)
-        with tempfile.TemporaryDirectory(dir=self.repository) as directory:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as directory:
             path = gui.save_job_data(job, directory, overwrite=False)
             reopened = gui.load_job_path(path)
         self.assertEqual(reopened["programming"]["operation_count"], 2)
