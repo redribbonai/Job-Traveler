@@ -305,8 +305,8 @@ class TravelerDomainContractTests(unittest.TestCase):
         self.assertEqual(persisted["_shopos"], metadata)
         self.assertEqual(domain.document_revision(persisted), 1)
 
-    def test_contract_version_is_deliberately_version_two(self):
-        self.assertEqual(domain.DOMAIN_CONTRACT_VERSION, 2)
+    def test_contract_version_is_deliberately_version_three(self):
+        self.assertEqual(domain.DOMAIN_CONTRACT_VERSION, 3)
 
 
 if __name__ == "__main__":

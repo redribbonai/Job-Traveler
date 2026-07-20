@@ -1,5 +1,6 @@
 # job_traveler.py
 import copy
+import getpass
 import os
 from datetime import datetime
 from pathlib import Path
@@ -10,10 +11,18 @@ from traveler_persistence import (
     MODE_ENV,
     PersistenceConflict,
     PersistenceError,
+    PlanResizeConfirmationRequired,
+    PlanResizeConflict,
     TravelerPersistence,
     build_persistence,
     set_conflict_value,
 )
+from desktop_session import (
+    DesktopSessionManager,
+    SessionConfigurationError,
+    build_session_manager_from_environment,
+)
+from traveler_client import TravelerClientError
 
 from traveler_domain import (  # compatibility re-exports for existing callers
     ALLOWED_OPERATIONS,
@@ -924,7 +933,256 @@ def job_menu(job):
             print("Invalid choice. Please try again.")
 
 
-def main(persistence=None):
+def _terminal_confirm_default_no(prompt):
+    return input(f"{prompt} [y/N]: ").strip().casefold() == "y"
+
+
+def _service_update_ordinary(job, persistence):
+    """Edit one established ordinary allowlisted field in service mode."""
+    import traveler_domain as domain
+
+    normalized = normalize_operations(job)
+    sections = tuple(
+        dict.fromkeys(
+            tuple(domain.SECTION_EDITABLE_FIELDS)
+            + tuple(domain.OPERATION_EDITABLE_FIELDS)
+        )
+    )
+    print("\nOrdinary sections")
+    for index, section in enumerate(sections, 1):
+        print(f"{index}. {section.replace('_', ' ').title()}")
+    try:
+        section = sections[get_positive_int("Section number") - 1]
+    except (IndexError, ValueError):
+        print("Invalid section.")
+        return False
+    fields = domain.SECTION_EDITABLE_FIELDS.get(section, {})
+    operation_number = None
+    if section in domain.OPERATION_EDITABLE_FIELDS:
+        operations = normalized[section]["records" if section == "inspection" else "operations"]
+        if not operations:
+            print("No existing operation record is available to edit.")
+            return False
+        operation_number = get_positive_int("Operation number")
+        row = operation_by_number(operations, operation_number)
+        if row is None:
+            print("That operation record does not exist.")
+            return False
+        fields = domain.OPERATION_EDITABLE_FIELDS[section]
+    print("Editable fields: " + ", ".join(fields))
+    field = input("Field: ").strip()
+    if field not in fields:
+        print("That field is not in the ordinary allowlist.")
+        return False
+    if operation_number is None:
+        current = normalized[section].get(field, "")
+        reference = section
+        target = {"section": section, "field": field, "compatibility_reference": reference}
+    else:
+        key = "records" if section == "inspection" else "operations"
+        current = operation_by_number(normalized[section][key], operation_number).get(field, "")
+        reference = f"{section}:operation:{operation_number}"
+        target = {"section": section, "field": field, "compatibility_reference": reference}
+    value = input(f"New value [current: {current}]: ")
+    if value == "":
+        value = current
+    if fields[field] == "quantity":
+        try:
+            value = int(value)
+            if value < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            print("The quantity must be a non-negative whole number.")
+            return False
+    candidate, _confirmed = domain.apply_ordinary_field_change(
+        copy.deepcopy(job), target, value
+    )
+    job.clear()
+    job.update(candidate)
+    if save_job(job, persistence=persistence):
+        return True
+    return False
+
+
+def _service_resize_plan(job, persistence):
+    if not persistence.job_planner_authorized:
+        print("\nOperation-plan resizing requires Job Planner authorization.")
+        return False
+    tracked = _loaded_snapshots.get(id(job))
+    base = tracked[1] if tracked is not None and tracked[0] is job else None
+    if base is None:
+        print("\nThe traveler must be loaded again before resizing.")
+        return False
+    current = normalize_operations(job)["programming"]["operation_count"]
+    desired = get_positive_int("Desired operation count", current)
+    try:
+        result = persistence.resize_plan(base, desired)
+    except PlanResizeConfirmationRequired as confirmation:
+        print("\nThe latest plan would remove:")
+        for item in confirmation.removed_operations:
+            detail = ", ".join(item.get("meaningful_sections", ()))
+            print(
+                f"  Operation {item['operation_number']}"
+                + (f" (entered data: {detail})" if detail else "")
+            )
+        if not _terminal_confirm_default_no("Remove exactly these operations"):
+            print("Resize canceled. No change was written.")
+            return False
+        try:
+            result = persistence.resize_plan(
+                base,
+                desired,
+                confirm_removed_operation_ids=confirmation.operation_ids,
+            )
+        except PlanResizeConflict as conflict:
+            job.clear()
+            job.update(copy.deepcopy(conflict.latest_snapshot.traveler))
+            _loaded_snapshots[id(job)] = (job, conflict.latest_snapshot)
+            print("\nThe plan changed before confirmation. Review the latest traveler.")
+            return False
+    except PlanResizeConflict as conflict:
+        job.clear()
+        job.update(copy.deepcopy(conflict.latest_snapshot.traveler))
+        _loaded_snapshots[id(job)] = (job, conflict.latest_snapshot)
+        print("\nThe operation plan changed. Review the latest traveler.")
+        return False
+    except PersistenceError as error:
+        print(f"\nOperation plan was not resized: {error}")
+        return False
+    job.clear()
+    job.update(copy.deepcopy(result.snapshot.traveler))
+    _loaded_snapshots[id(job)] = (job, result.snapshot)
+    print("\nOperation plan resized." if result.changed else "\nOperation plan unchanged.")
+    return True
+
+
+def _service_create_new_job(persistence):
+    if not persistence.job_planner_authorized:
+        print("\nCreating travelers requires Job Planner authorization.")
+        return None
+    job = {
+        "job_number": input("Job Number: ").strip(),
+        "customer": input("Customer: ").strip(),
+        "part_number": input("Part Number: ").strip(),
+        "description": input("Description: ").strip(),
+        "qty_to_make": get_int("Qty To Make"),
+        "material": input("Material: ").strip(),
+        "cut_length": input("Cut Length: ").strip(),
+        "programming": {},
+        "saw_cutting": {},
+        "cnc_machining": {},
+        "deburr": {},
+        "inspection": {},
+        "packing": {},
+        "shipping": {},
+    }
+    count = get_positive_int("Number of Operations Required", 1)
+    if count != 1:
+        job = resize_operation_plan(job, count)
+    return job if save_job(job, persistence=persistence) else None
+
+
+def _service_job_menu(job, persistence, manager):
+    while True:
+        print("\nJob Menu (service mode)")
+        print("-" * 30)
+        print("1. Edit Ordinary Field")
+        if manager.is_job_planner:
+            print("2. Resize Operation Plan")
+        print("3. Print Traveler")
+        print("4. Print Status Summary")
+        print("0. Exit to Main Menu")
+        choice = input("Choose an option: ").strip()
+        if choice == "1":
+            _service_update_ordinary(job, persistence)
+        elif choice == "2" and manager.is_job_planner:
+            _service_resize_plan(job, persistence)
+        elif choice == "3":
+            print_traveler(job)
+        elif choice == "4":
+            print_job_status_summary(job)
+        elif choice == "0":
+            return
+        else:
+            print("Invalid choice. Please choose an available option.")
+
+
+def _service_login(manager):
+    username = input("Username: ").strip()
+    pin = getpass.getpass("Four-digit PIN: ")
+    try:
+        remember = _terminal_confirm_default_no("Remember this session securely")
+        return manager.login(username, pin, remember=remember)
+    except TravelerClientError as error:
+        print(f"\nSign in failed: {error.public_message}")
+        return None
+    finally:
+        pin = ""
+
+
+def main(persistence=None, session_manager=None):
+    selected_mode = os.environ.get(MODE_ENV, "local")
+    if session_manager is None and selected_mode.casefold() == "service":
+        try:
+            session_manager = build_session_manager_from_environment()
+        except (SessionConfigurationError, TravelerClientError) as error:
+            print(f"ShopOS service configuration is unavailable: {error}")
+            return
+    if session_manager is not None:
+        if persistence is not None:
+            raise ValueError("A service session cannot be combined with injected persistence.")
+        if session_manager.restore_remembered_session() is None:
+            while not session_manager.signed_in:
+                print("\nShopOS Employee Sign In")
+                if _service_login(session_manager) is None:
+                    if not _terminal_confirm_default_no("Try signing in again"):
+                        return
+        active = build_persistence(
+            jobs_directory=None, mode="service", service_client=session_manager.client
+        )
+        configure_persistence(active)
+        while True:
+            print("\nMain Menu (service mode)")
+            print("-" * 30)
+            print(
+                f"Signed in: {session_manager.employee.display_name or session_manager.employee.username}"
+            )
+            print("1. Create New Job Traveler")
+            print("2. Open Existing Job Traveler")
+            print("3. List Existing Job Travelers")
+            print("4. Switch Employee")
+            print("5. Sign Out")
+            print("0. Exit")
+            choice = input("Choose an option: ").strip()
+            if choice == "1":
+                job = _service_create_new_job(active)
+                if job is not None:
+                    _service_job_menu(job, active, session_manager)
+            elif choice == "2":
+                job = load_job(input("Job Number: ").strip(), persistence=active)
+                if job is not None:
+                    _service_job_menu(job, active, session_manager)
+            elif choice == "3":
+                list_existing_jobs(persistence=active)
+            elif choice in {"4", "5"}:
+                result = session_manager.switch_employee() if choice == "4" else session_manager.sign_out()
+                if not result.server_invalidation_confirmed:
+                    print("Server-side sign-out could not be confirmed; local session was cleared.")
+                if choice == "5":
+                    return
+                while not session_manager.signed_in:
+                    print("\nShopOS Employee Sign In")
+                    if _service_login(session_manager) is None:
+                        if not _terminal_confirm_default_no("Try signing in again"):
+                            return
+            elif choice == "0":
+                session_manager.sign_out()
+                print("Goodbye.")
+                return
+            else:
+                print("Invalid choice. Please choose an available option.")
+        return
+
     configure_persistence(_active_persistence(persistence))
     while True:
         print("\nMain Menu")

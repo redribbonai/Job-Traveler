@@ -7,8 +7,11 @@ from typing import Any
 
 import traveler_domain as domain
 from traveler_client import (
+    ClientAlreadyExistsError,
     ClientConflictError,
     ClientNotFoundError,
+    ClientPlanConflictError,
+    ClientShrinkConfirmationRequired,
     ClientTraveler,
     TravelerClient,
     TravelerClientError,
@@ -16,9 +19,13 @@ from traveler_client import (
 from traveler_persistence import (
     ConflictField,
     PersistenceConflict,
+    PersistenceAlreadyExistsError,
     PersistenceNotFoundError,
+    PersistenceError,
     PersistenceStorageError,
     PersistenceValidationError,
+    PlanResizeConfirmationRequired,
+    PlanResizeConflict,
     SaveResult,
     TravelerPersistence,
     TravelerSnapshot,
@@ -164,6 +171,10 @@ class ServiceTravelerPersistence(TravelerPersistence):
             raise PersistenceValidationError("An authenticated TravelerClient is required.")
         self.client = client
 
+    @property
+    def job_planner_authorized(self) -> bool:
+        return self.client.has_capability("job_planner")
+
     @staticmethod
     def _service_failure(error: TravelerClientError):
         if isinstance(error, ClientNotFoundError):
@@ -212,10 +223,117 @@ class ServiceTravelerPersistence(TravelerPersistence):
         return summaries
 
     def create(self, traveler: dict[str, Any], *, overwrite: bool = False) -> SaveResult:
-        del traveler, overwrite
-        raise UnsupportedPersistenceAction(
-            "Service mode does not expose Job Traveler creation in Phase 2C."
-        )
+        del overwrite  # The service never overwrites, regardless of desktop legacy intent.
+        if not self.job_planner_authorized:
+            raise UnsupportedPersistenceAction(
+                "Job Traveler creation requires the Job Planner capability."
+            )
+        try:
+            candidate = domain.canonical_job(traveler)
+            if "_shopos" in candidate:
+                raise PersistenceValidationError(
+                    "Creation cannot supply ShopOS metadata."
+                )
+            header_names = {
+                "job_number",
+                "customer",
+                "part_number",
+                "description",
+                "qty_to_make",
+                "material",
+                "cut_length",
+            }
+            if set(candidate) != header_names | set(domain.SECTIONS):
+                raise PersistenceValidationError(
+                    "The intended new Job Traveler contains unsupported fields."
+                )
+            header = {name: copy.deepcopy(candidate[name]) for name in header_names}
+            operation_count = candidate["programming"]["operation_count"]
+            section_inputs = {
+                section: {
+                    field: copy.deepcopy(candidate[section][field])
+                    for field in domain.SECTION_EDITABLE_FIELDS.get(section, {})
+                    if field in candidate[section]
+                }
+                for section in domain.SECTIONS
+            }
+            reconstructed = domain.build_new_traveler(
+                header, section_inputs, operation_count
+            )
+            if reconstructed != candidate:
+                raise PersistenceValidationError(
+                    "The intended new Job Traveler is not a supported creation shape."
+                )
+        except PersistenceValidationError:
+            raise
+        except (KeyError, TypeError, ValueError, RecursionError) as error:
+            raise PersistenceValidationError(
+                "The intended new Job Traveler is invalid."
+            ) from error
+        try:
+            result = self.client.create_traveler(
+                header=header,
+                section_inputs=section_inputs,
+                operation_count=operation_count,
+            )
+        except ClientAlreadyExistsError as error:
+            raise PersistenceAlreadyExistsError(error.public_message) from error
+        except TravelerClientError as error:
+            raise self._service_failure(error) from error
+        return self._result(result)
+
+    def resize_plan(
+        self,
+        base: TravelerSnapshot,
+        operation_count: int,
+        *,
+        confirm_removed_operation_ids: list[str] | None = None,
+    ) -> SaveResult:
+        if not self.job_planner_authorized:
+            raise UnsupportedPersistenceAction(
+                "Operation-plan resizing requires the Job Planner capability."
+            )
+        try:
+            result = self.client.resize_plan(
+                base.job_number,
+                operation_count=operation_count,
+                document_revision=base.document_revision,
+                read_version=base.read_version,
+                confirm_removed_operation_ids=confirm_removed_operation_ids,
+            )
+        except ClientShrinkConfirmationRequired as error:
+            confirmation = error.confirmation
+            try:
+                removed = confirmation["removed_operations"]
+                if (
+                    confirmation["document_revision"] != base.document_revision
+                    or confirmation["read_version"] != base.read_version
+                    or confirmation["requested_operation_count"] != operation_count
+                    or not isinstance(removed, list)
+                    or not removed
+                ):
+                    raise KeyError
+            except (KeyError, TypeError):
+                raise PersistenceValidationError(
+                    "The shrink confirmation response is invalid."
+                ) from error
+            raise PlanResizeConfirmationRequired(
+                requested_count=operation_count,
+                document_revision=base.document_revision,
+                read_version=base.read_version,
+                removed_operations=removed,
+            ) from error
+        except ClientPlanConflictError as error:
+            try:
+                latest = self.load(base.job_number)
+            except PersistenceError:
+                raise PersistenceStorageError(
+                    "The latest operation plan could not be loaded."
+                ) from error
+            raise PlanResizeConflict(latest) from error
+        except TravelerClientError as error:
+            raise self._service_failure(error) from error
+        return self._result(result)
 
     def _conflict(
         self,
@@ -283,7 +401,7 @@ class ServiceTravelerPersistence(TravelerPersistence):
     ) -> SaveResult:
         if action == "plan_resize":
             raise UnsupportedPersistenceAction(
-                "Operation-plan resizing is not authorized in service mode."
+                "Use the dedicated operation-plan resize action in service mode."
             )
         if action != "logical_save":
             raise UnsupportedPersistenceAction("The requested service action is unsupported.")

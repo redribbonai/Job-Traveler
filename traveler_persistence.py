@@ -76,6 +76,36 @@ class UnsupportedPersistenceAction(PersistenceError):
     """Raised when the selected implementation cannot perform an action safely."""
 
 
+class PlanResizeConfirmationRequired(PersistenceError):
+    """A shrink needs an explicit confirmation of the latest stable identities."""
+
+    def __init__(
+        self,
+        *,
+        requested_count: int,
+        document_revision: int,
+        read_version: str,
+        removed_operations: list[dict[str, Any]],
+    ) -> None:
+        self.requested_count = requested_count
+        self.document_revision = document_revision
+        self.read_version = read_version
+        self.removed_operations = tuple(copy.deepcopy(removed_operations))
+        super().__init__("Confirm the exact operations that would be removed.")
+
+    @property
+    def operation_ids(self) -> list[str]:
+        return [item["operation_id"] for item in self.removed_operations]
+
+
+class PlanResizeConflict(PersistenceError):
+    """The plan changed before a resize or shrink confirmation."""
+
+    def __init__(self, latest_snapshot: "TravelerSnapshot") -> None:
+        self.latest_snapshot = latest_snapshot
+        super().__init__("The operation plan changed. Review the latest traveler.")
+
+
 @dataclass(frozen=True)
 class TravelerSnapshot:
     """One desktop document paired with its authoritative strong read version."""
@@ -201,6 +231,22 @@ class TravelerPersistence(ABC):
         """Retry one explicit user decision against the returned latest version."""
         rebased = rebase_conflict_intent(conflict, intended)
         return self.save(conflict.latest_snapshot, rebased, action=action)
+
+    @property
+    def job_planner_authorized(self) -> bool:
+        return self.mode == "local"
+
+    def resize_plan(
+        self,
+        base: TravelerSnapshot,
+        operation_count: int,
+        *,
+        confirm_removed_operation_ids: list[str] | None = None,
+    ) -> SaveResult:
+        del base, operation_count, confirm_removed_operation_ids
+        raise UnsupportedPersistenceAction(
+            "This persistence mode has no dedicated plan-resize command."
+        )
 
 
 def _safe_job_number(value: object) -> str:
@@ -1021,6 +1067,8 @@ __all__ = [
     "PersistenceError",
     "PersistenceLockTimeoutError",
     "PersistenceNotFoundError",
+    "PlanResizeConfirmationRequired",
+    "PlanResizeConflict",
     "PersistenceStorageError",
     "PersistenceValidationError",
     "SaveResult",

@@ -22,13 +22,16 @@ from traveler_client import (
     ClientConflictError,
     ClientFeatureDisabledError,
     ClientNetworkDeniedError,
+    ClientShrinkConfirmationRequired,
     ClientTimeoutError,
     ClientUnavailableError,
     ClientValidationError,
     HttpsEnforcementError,
+    EmployeeIdentity,
     TravelerClient,
 )
 from traveler_persistence import (
+    PlanResizeConfirmationRequired,
     PersistenceConfigurationError,
     TravelerSnapshot,
     UnsupportedPersistenceAction,
@@ -132,6 +135,67 @@ def command_response(request_id, command="set_field", *, document=None, revision
         "traveler": view,
     }
     return FakeResponse(200, body)
+
+
+def new_traveler(job_number="NEW-SAFE-JOB", operation_count=2, request_id=REQUEST_ONE):
+    header = {
+        "job_number": job_number,
+        "customer": "Sanitized Customer",
+        "part_number": "SAFE-PART",
+        "description": "Temporary test traveler",
+        "qty_to_make": 10,
+        "material": "6061-T6",
+        "cut_length": "3.00",
+    }
+    section_inputs = {section: {} for section in domain.SECTIONS}
+    document = domain.build_new_traveler(header, section_inputs, operation_count)
+    ids = (str(uuid.UUID(int=index)) for index in range(1, 100))
+    document = domain.bootstrap_stable_identities(document, lambda: next(ids))
+    document = domain.confirm_mutation_metadata(
+        document, prior_revision=0, mutation_id=request_id
+    )
+    return header, section_inputs, document
+
+
+def structural_response(
+    request_id,
+    command,
+    *,
+    document,
+    operation_count,
+    status=200,
+    replayed=False,
+):
+    view = projection(
+        document=document,
+        version="sha256:" + "b" * 64,
+        revision=domain.document_revision(document),
+    )
+    return FakeResponse(
+        status,
+        {
+            "request_id": request_id,
+            "resource_id": f"traveler:{document['job_number']}",
+            "command": command,
+            "applied": not replayed,
+            "replayed": replayed,
+            "no_op": False,
+            "operation_count": operation_count,
+            "document_revision": domain.document_revision(document),
+            "read_version": view["read_version"],
+            "traveler": view,
+        },
+    )
+
+
+def planner_identity():
+    return EmployeeIdentity(
+        username="Planner",
+        display_name=None,
+        approved=True,
+        enabled=True,
+        capabilities=("job_planner",),
+    )
 
 
 class TravelerClientTests(unittest.TestCase):
@@ -250,6 +314,132 @@ class TravelerClientTests(unittest.TestCase):
         )
         self.assertNotEqual(first.request_id, second.request_id)
 
+    def test_login_validation_logout_and_safe_identity_projection(self):
+        transport = ScriptedTransport(
+            FakeResponse(
+                200,
+                {
+                    "session": {
+                        "token": TOKEN,
+                        "token_type": "Bearer",
+                        "expires_at": "2026-08-01T00:00:00+00:00",
+                    },
+                    "account": {
+                        "username": "Planner",
+                        "display_name": None,
+                        "approved": True,
+                        "enabled": True,
+                        "capabilities": ["job_planner"],
+                    },
+                },
+            ),
+            FakeResponse(
+                200,
+                {
+                    "account": {
+                        "username": "Planner",
+                        "display_name": None,
+                        "approved": True,
+                        "enabled": True,
+                        "capabilities": ["job_planner"],
+                    }
+                },
+            ),
+            FakeResponse(204, {}),
+        )
+        client = TravelerClient("https://shop.example.test", transport=transport)
+        login = client.login("Planner", "2468")
+        client.set_bearer_session(login.token, login.employee)
+        self.assertTrue(client.validate_session().is_job_planner)
+        client.logout()
+        with self.assertRaises(ClientAuthenticationError):
+            client.get_traveler("SAFE-JOB")
+        self.assertNotIn(TOKEN, repr(login))
+
+    def test_typed_create_resize_confirmation_and_ambiguous_replay(self):
+        header, sections, created_document = new_traveler()
+        expanded = domain.resize_operation_plan_structural(created_document, 3)
+        expanded = domain.bootstrap_stable_identities(
+            expanded, lambda: "00000000-0000-4000-8000-000000000099"
+        )
+        expanded = domain.confirm_mutation_metadata(
+            expanded, prior_revision=1, mutation_id=REQUEST_TWO
+        )
+        confirmation = {
+            "document_revision": 2,
+            "read_version": "sha256:" + "b" * 64,
+            "current_operation_count": 3,
+            "requested_operation_count": 2,
+            "removed_operations": [
+                {
+                    "operation_number": 3,
+                    "operation_id": "00000000-0000-4000-8000-000000000099",
+                    "contains_meaningful_data": False,
+                    "meaningful_sections": [],
+                }
+            ],
+        }
+        lost = requests.exceptions.ReadTimeout(f"must redact {TOKEN}")
+        transport = ScriptedTransport(
+            structural_response(
+                REQUEST_ONE,
+                "create_traveler",
+                document=created_document,
+                operation_count=2,
+                status=201,
+            ),
+            lost,
+            structural_response(
+                REQUEST_TWO,
+                "resize_plan",
+                document=expanded,
+                operation_count=3,
+                replayed=True,
+            ),
+            FakeResponse(
+                409,
+                {
+                    "error": {"code": "shrink_confirmation_required"},
+                    "current": confirmation,
+                },
+            ),
+        )
+        ids = iter((REQUEST_ONE, REQUEST_TWO, str(uuid.uuid4())))
+        client = TravelerClient(
+            "https://shop.example.test",
+            TOKEN,
+            transport=transport,
+            request_id_factory=lambda: next(ids),
+        )
+        client.set_bearer_session(TOKEN, planner_identity())
+        created = client.create_traveler(
+            header=header, section_inputs=sections, operation_count=2
+        )
+        self.assertEqual(created.document_revision, 1)
+        with self.assertRaises(AmbiguousTransportError) as raised:
+            client.resize_plan(
+                "NEW-SAFE-JOB",
+                operation_count=3,
+                document_revision=1,
+                read_version=created.read_version,
+            )
+        replayed = client.retry_ambiguous(raised.exception)
+        self.assertTrue(replayed.replayed)
+        self.assertEqual(
+            transport.calls[1][2]["json"], transport.calls[2][2]["json"]
+        )
+        with self.assertRaises(ClientShrinkConfirmationRequired) as shrink:
+            client.resize_plan(
+                "NEW-SAFE-JOB",
+                operation_count=2,
+                document_revision=2,
+                read_version="sha256:" + "b" * 64,
+            )
+        self.assertEqual(
+            shrink.exception.confirmation["removed_operations"][0]["operation_number"],
+            3,
+        )
+
 
 class ServicePersistenceTests(unittest.TestCase):
     def client_for(self, *responses, ids=(REQUEST_ONE, REQUEST_TWO)):
@@ -291,14 +481,62 @@ class ServicePersistenceTests(unittest.TestCase):
                 mode="service", jobs_directory=tempfile.gettempdir(), service_client=client
             )
 
-    def test_structural_resize_is_refused_before_http(self):
+    def test_structural_actions_require_planner_identity_before_http(self):
         client = self.client_for()
         persistence = ServiceTravelerPersistence(client)
         base = self.snapshot()
         intended = domain.resize_operation_plan(base.traveler, 3)
         with self.assertRaises(UnsupportedPersistenceAction):
             persistence.save(base, intended, action="plan_resize")
+        with self.assertRaises(UnsupportedPersistenceAction):
+            persistence.resize_plan(base, 3)
         self.assertFalse(client.transport.calls)
+
+    def test_planner_persistence_create_and_resize_confirmation(self):
+        header, sections, created_document = new_traveler()
+        created_response = structural_response(
+            REQUEST_ONE,
+            "create_traveler",
+            document=created_document,
+            operation_count=2,
+            status=201,
+        )
+        confirmation = {
+            "document_revision": 1,
+            "read_version": "sha256:" + "b" * 64,
+            "current_operation_count": 2,
+            "requested_operation_count": 1,
+            "removed_operations": [
+                {
+                    "operation_number": 2,
+                    "operation_id": created_document["_shopos"]
+                    ["operation_identities"]["machining_operations"]["2"],
+                    "contains_meaningful_data": False,
+                    "meaningful_sections": [],
+                }
+            ],
+        }
+        client = self.client_for(
+            created_response,
+            FakeResponse(
+                409,
+                {
+                    "error": {"code": "shrink_confirmation_required"},
+                    "current": confirmation,
+                },
+            ),
+        )
+        client.set_bearer_session(TOKEN, planner_identity())
+        persistence = ServiceTravelerPersistence(client)
+        candidate = domain.build_new_traveler(header, sections, 2)
+        created = persistence.create(candidate)
+        self.assertTrue(created.changed)
+        with self.assertRaises(PlanResizeConfirmationRequired) as raised:
+            persistence.resize_plan(created.snapshot, 1)
+        self.assertEqual(
+            raised.exception.operation_ids,
+            [confirmation["removed_operations"][0]["operation_id"]],
+        )
 
 
 if __name__ == "__main__":

@@ -22,12 +22,21 @@ from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
 
 import job_traveler as terminal_app
+from desktop_session import (
+    DesktopSessionManager,
+    SessionConfigurationError,
+    build_session_manager_from_environment,
+)
+from traveler_client import TravelerClientError
 from traveler_persistence import (
     MODE_ENV,
     LocalTravelerPersistence,
     PersistenceAlreadyExistsError,
     PersistenceConflict,
+    PersistenceConfigurationError,
     PersistenceError,
+    PlanResizeConfirmationRequired,
+    PlanResizeConflict,
     TravelerPersistence,
     build_persistence,
     set_conflict_value,
@@ -723,6 +732,29 @@ def apply_programming_update(job, values, timestamp=None):
     return programming
 
 
+def apply_service_programming_update(job, values):
+    """Apply only the established ordinary Programming field allowlist."""
+    candidate = normalized_job(job)
+    programming = candidate["programming"]
+    raw_operations = values.get("operations")
+    if (
+        not isinstance(raw_operations, list)
+        or len(raw_operations) != programming["operation_count"]
+    ):
+        raise ValidationError("Provide one Programming record for each operation.")
+    programming["programmer"] = clean_text(values.get("programmer"))
+    for number, raw in enumerate(raw_operations, start=1):
+        if not isinstance(raw, dict):
+            raise ValidationError(f"Operation {number} must be a record.")
+        operation = programming["operations"][number - 1]
+        operation["program_name"] = clean_text(raw.get("program_name"))
+        operation["revision"] = clean_text(raw.get("revision"))
+        operation["notes"] = clean_text(raw.get("notes"))
+    job.clear()
+    job.update(candidate)
+    return programming
+
+
 STANDARD_SECTION_RULES = {
     "saw_cutting": {
         "text": ("employee", "cut_length", "notes"),
@@ -755,6 +787,23 @@ def apply_standard_section_update(job, section_name, values, timestamp=None):
         values.get("status"), "Status", terminal_app.ALLOWED_STATUSES
     )
     return merge_section(job, section_name, changes, timestamp)
+
+
+def apply_service_standard_section_update(job, section_name, values):
+    """Apply one ordinary section edit without a workflow/status transition."""
+    if section_name not in STANDARD_SECTION_RULES:
+        raise ValidationError(f"Unsupported standard section: {section_name}")
+    rules = STANDARD_SECTION_RULES[section_name]
+    changes = {key: clean_text(values.get(key)) for key in rules["text"]}
+    for key, label in rules["integer"]:
+        changes[key] = parse_nonnegative_integer(values.get(key), label)
+    current = job.get(section_name)
+    if not isinstance(current, dict):
+        raise ValidationError(
+            f"Traveler section '{section_name}' must contain a JSON object."
+        )
+    current.update(changes)
+    return current
 
 
 def resolve_cnc_machine(job, operation_number=1):
@@ -822,6 +871,33 @@ def apply_cnc_update(job, values, timestamp=None):
     return updated
 
 
+def apply_service_cnc_update(job, values):
+    """Apply only operator, machine, and notes to one existing CNC operation."""
+    candidate = normalized_job(job)
+    operation_number = parse_positive_integer(values.get("operation_number"), "Operation")
+    programming_operation = terminal_app.operation_by_number(
+        candidate["programming"]["operations"], operation_number
+    )
+    updated = terminal_app.operation_by_number(
+        candidate["cnc_machining"]["operations"], operation_number
+    )
+    if programming_operation is None or updated is None:
+        raise ValidationError("Select an existing configured operation.")
+    operation_type = require_choice(
+        programming_operation.get("operation_type"),
+        "Operation Type",
+        terminal_app.ALLOWED_OPERATIONS,
+    )
+    updated["operator"] = clean_text(values.get("operator"))
+    updated["machine"] = require_choice(
+        values.get("machine"), "Machine", machines_for_operation(operation_type)
+    )
+    updated["notes"] = clean_text(values.get("notes"))
+    job.clear()
+    job.update(candidate)
+    return updated
+
+
 def apply_inspection_update(job, values, timestamp=None):
     """Update one inspection record using Programming/CNC-derived snapshots."""
     candidate = normalized_job(job)
@@ -873,6 +949,25 @@ def apply_inspection_update(job, values, timestamp=None):
         "last_updated",
     ):
         inspection.pop(key, None)
+    job.clear()
+    job.update(candidate)
+    return record
+
+
+def apply_service_inspection_update(job, values):
+    """Apply only ordinary fields to an existing inspection projection."""
+    candidate = normalized_job(job)
+    operation_number = parse_positive_integer(values.get("operation_number"), "Operation")
+    record = terminal_app.operation_by_number(
+        candidate["inspection"]["records"], operation_number
+    )
+    if record is None:
+        raise ValidationError(
+            "This operation has no existing inspection record to edit in service mode."
+        )
+    record["inspector"] = clean_text(values.get("inspector"))
+    record["report_type"] = clean_text(values.get("report_type"))
+    record["notes"] = clean_text(values.get("notes"))
     job.clear()
     job.update(candidate)
     return record
@@ -979,13 +1074,30 @@ class ScrollableFrame(ttk.Frame):
 class JobTravelerApp:
     """Single-window, navigable Job Traveler GUI controller."""
 
-    def __init__(self, root, jobs_directory=None, persistence=None):
+    def __init__(
+        self,
+        root,
+        jobs_directory=None,
+        persistence=None,
+        session_manager=None,
+    ):
         self.root = root
+        if session_manager is not None and not isinstance(
+            session_manager, DesktopSessionManager
+        ):
+            raise TypeError("session_manager must implement DesktopSessionManager")
+        if session_manager is not None and (
+            persistence is not None or jobs_directory is not None
+        ):
+            raise ValueError(
+                "A service session cannot be combined with local persistence."
+            )
+        self.session_manager = session_manager
         if persistence is not None and not isinstance(persistence, TravelerPersistence):
             raise TypeError("persistence must implement TravelerPersistence")
         if persistence is not None and jobs_directory is not None:
             raise ValueError("Choose an injected persistence implementation or a local path.")
-        if persistence is None:
+        if persistence is None and session_manager is None:
             selected_mode = os.environ.get(MODE_ENV, "local").casefold()
             local_directory = (
                 get_jobs_directory(jobs_directory) if selected_mode == "local" else None
@@ -1004,7 +1116,15 @@ class JobTravelerApp:
         self.root.configure(background=BACKGROUND)
         self.root.protocol("WM_DELETE_WINDOW", self.close_application)
         self._configure_styles()
-        self.show_home()
+        if self.session_manager is not None:
+            identity = self.session_manager.restore_remembered_session()
+            if identity is None:
+                self.show_login()
+            else:
+                self._activate_service_persistence()
+                self.show_home()
+        else:
+            self.show_home()
 
     def _configure_styles(self):
         self.style = apply_shopos_theme(self.root)
@@ -1014,6 +1134,7 @@ class JobTravelerApp:
             child.destroy()
 
     def page_header(self, parent, title, subtitle=""):
+        self._session_bar(parent)
         ttk.Label(parent, text=title, style="Heading.TLabel").pack(anchor="w")
         if subtitle:
             ttk.Label(parent, text=subtitle, style="Subheading.TLabel").pack(
@@ -1025,25 +1146,179 @@ class JobTravelerApp:
     def close_application(self):
         self.root.destroy()
 
+    @property
+    def service_mode(self):
+        return self.session_manager is not None or (
+            self.persistence is not None and self.persistence.mode == "service"
+        )
+
+    @property
+    def job_planner_authorized(self):
+        if self.session_manager is not None:
+            return self.session_manager.is_job_planner
+        return bool(
+            self.persistence is not None
+            and self.persistence.job_planner_authorized
+        )
+
+    def _activate_service_persistence(self):
+        if self.session_manager is None or not self.session_manager.signed_in:
+            self.persistence = None
+            return
+        self.persistence = build_persistence(
+            jobs_directory=None,
+            mode="service",
+            service_client=self.session_manager.client,
+        )
+        self.jobs_directory = None
+
+    def _session_bar(self, parent):
+        if self.session_manager is None or self.session_manager.employee is None:
+            return
+        bar = ttk.Frame(parent, style="App.TFrame")
+        bar.pack(fill="x", pady=(0, SPACE_TIGHT))
+        identity = self.session_manager.employee
+        shown = identity.display_name or identity.username
+        ttk.Label(
+            bar,
+            text=f"Signed in: {shown}",
+            style="Subheading.TLabel",
+        ).pack(side="left")
+        ttk.Button(
+            bar,
+            text="Sign Out",
+            style="Action.TButton",
+            command=self._sign_out,
+        ).pack(side="right")
+        ttk.Button(
+            bar,
+            text="Switch Employee",
+            style="Action.TButton",
+            command=self._switch_employee,
+        ).pack(side="right", padx=(0, 8))
+
+    def show_login(self):
+        self.clear_screen()
+        self.persistence = None
+        frame = ttk.Frame(self.root, style="App.TFrame", padding=SPACE_SECTION)
+        frame.pack(fill="both", expand=True)
+        center = ttk.Frame(frame, style="App.TFrame")
+        center.place(relx=0.5, rely=0.45, anchor="center")
+        ttk.Label(center, text="ShopOS Employee Sign In", style="Heading.TLabel").pack(
+            anchor="w", pady=(0, SPACE_SECTION)
+        )
+        ttk.Label(center, text="Username:", style="Field.TLabel").pack(anchor="w")
+        username = ttk.Entry(center, width=38)
+        username.pack(fill="x", pady=(4, 12))
+        ttk.Label(center, text="Four-digit PIN:", style="Field.TLabel").pack(
+            anchor="w"
+        )
+        pin = ttk.Entry(center, width=38, show="•")
+        pin.pack(fill="x", pady=(4, 12))
+        remember = tk.BooleanVar(value=False)
+        remember_control = ttk.Checkbutton(
+            center, text="Remember this session securely", variable=remember
+        )
+        remember_control.pack(anchor="w")
+        if self.session_manager is not None and not self.session_manager.can_remember:
+            remember_control.state(["disabled"])
+            ttk.Label(
+                center,
+                text="Secure credential storage is unavailable; sign-in is memory-only.",
+                style="Subheading.TLabel",
+                wraplength=420,
+            ).pack(anchor="w", pady=(6, 0))
+        if self.session_manager is not None and self.session_manager.last_notice:
+            ttk.Label(
+                center,
+                text=self.session_manager.last_notice,
+                style="Subheading.TLabel",
+                wraplength=420,
+            ).pack(anchor="w", pady=(8, 0))
+
+        def submit(_event=None):
+            raw_pin = pin.get()
+            try:
+                self.session_manager.login(
+                    username.get().strip(), raw_pin, remember=remember.get()
+                )
+            except TravelerClientError as error:
+                messagebox.showerror(
+                    "Sign In Failed", error.public_message, parent=self.root
+                )
+                return
+            finally:
+                raw_pin = ""
+                pin.delete(0, "end")
+            self._activate_service_persistence()
+            self.show_home()
+
+        ttk.Button(
+            center, text="Sign In", style="Primary.TButton", command=submit
+        ).pack(fill="x", pady=(18, 6))
+        ttk.Button(
+            center, text="Exit", style="Action.TButton", command=self.close_application
+        ).pack(fill="x")
+        pin.bind("<Return>", submit)
+        username.focus_set()
+
+    def _finish_local_sign_out(self, result):
+        self.current_job = None
+        self.current_snapshot = None
+        self.current_path = None
+        self.persistence = None
+        if not result.server_invalidation_confirmed:
+            messagebox.showwarning(
+                "Signed Out Locally",
+                "The local session was removed, but server-side invalidation "
+                "could not be confirmed.",
+                parent=self.root,
+            )
+        self.show_login()
+
+    def _switch_employee(self):
+        if self.session_manager is not None:
+            self._finish_local_sign_out(self.session_manager.switch_employee())
+
+    def _sign_out(self):
+        if self.session_manager is not None:
+            self._finish_local_sign_out(self.session_manager.sign_out())
+
     def show_home(self):
+        if self.session_manager is not None and not self.session_manager.signed_in:
+            self.show_login()
+            return
         self.clear_screen()
         frame = ttk.Frame(self.root, style="App.TFrame", padding=SPACE_SECTION)
         frame.pack(fill="both", expand=True)
         center = ttk.Frame(frame, style="App.TFrame")
         center.place(relx=0.5, rely=0.44, anchor="center")
+        self._session_bar(center)
         ttk.Label(center, text=APP_TITLE, style="Title.TLabel").pack(pady=(0, 8))
         ttk.Label(
             center,
             text="Create and manage CNC shop travelers",
             style="Subheading.TLabel",
         ).pack(pady=(0, SPACE_SECTION))
-        ttk.Button(
+        create_button = ttk.Button(
             center,
             text="Create New Job",
             command=self.show_create_job,
             style="Primary.TButton",
             width=28,
-        ).pack(fill="x", pady=6)
+        )
+        create_button.pack(fill="x", pady=6)
+        if (
+            self.service_mode
+            and not self.job_planner_authorized
+        ):
+            create_button.state(["disabled"])
+            ttk.Label(
+                center,
+                text="Creating travelers requires Job Planner authorization.",
+                style="Subheading.TLabel",
+                wraplength=360,
+            ).pack(anchor="w", pady=(0, 6))
         ttk.Button(
             center,
             text="Open Existing Job",
@@ -1060,6 +1335,17 @@ class JobTravelerApp:
         ).pack(fill="x", pady=6)
 
     def show_create_job(self):
+        if (
+            self.service_mode
+            and not self.job_planner_authorized
+        ):
+            messagebox.showinfo(
+                "Job Planner Required",
+                "Creating travelers requires Job Planner authorization.",
+                parent=self.root,
+            )
+            self.show_home()
+            return
         self.clear_screen()
         scroll = ScrollableFrame(self.root)
         scroll.pack(fill="both", expand=True)
@@ -1080,6 +1366,8 @@ class JobTravelerApp:
             ("material", "Material"),
             ("cut_length", "Cut Length"),
         )
+        if self.service_mode:
+            labels += (("operation_count", "Number of Operations"),)
         entries = {}
         for row, (key, label) in enumerate(labels):
             ttk.Label(form, text=f"{label}:", style="Field.TLabel").grid(
@@ -1088,6 +1376,8 @@ class JobTravelerApp:
             entry = ttk.Entry(form, width=60)
             entry.grid(row=row, column=1, sticky="ew", pady=7)
             entries[key] = entry
+        if self.service_mode:
+            entries["operation_count"].insert(0, "1")
         form.columnconfigure(1, weight=1)
         entries["job_number"].focus_set()
 
@@ -1106,7 +1396,16 @@ class JobTravelerApp:
     def _create_job(self, entries):
         values = {key: widget.get() for key, widget in entries.items()}
         try:
+            operation_count = (
+                parse_positive_integer(
+                    values.pop("operation_count"), "Number of Operations"
+                )
+                if self.service_mode
+                else 1
+            )
             job = create_job_record(values)
+            if self.service_mode and operation_count != 1:
+                job = terminal_app.resize_operation_plan(job, operation_count)
         except ValidationError as error:
             messagebox.showerror("Invalid Job", str(error), parent=self.root)
             return
@@ -1114,6 +1413,13 @@ class JobTravelerApp:
         try:
             result = self.persistence.create(job, overwrite=False)
         except PersistenceAlreadyExistsError:
+            if self.service_mode:
+                messagebox.showerror(
+                    "Traveler Already Exists",
+                    "That Job Traveler already exists and was not changed.",
+                    parent=self.root,
+                )
+                return
             overwrite = messagebox.askyesno(
                 "Traveler Already Exists",
                 f"Job {job['job_number']} already exists. Replace that traveler?",
@@ -1376,6 +1682,8 @@ class JobTravelerApp:
             ("Packing", lambda: self.show_standard_section("packing")),
             ("Shipping", lambda: self.show_standard_section("shipping")),
         ) + self.traveler_view_actions()
+        if self.service_mode and self.job_planner_authorized:
+            actions += (("Resize Operation Plan", self.show_resize_plan),)
         for index, (label, command) in enumerate(actions):
             row, column = divmod(index, 3)
             ttk.Button(
@@ -1386,6 +1694,19 @@ class JobTravelerApp:
             ).grid(row=row, column=column, sticky="ew", padx=6, pady=6)
         for column in range(3):
             sections.columnconfigure(column, weight=1)
+        if self.service_mode and not self.job_planner_authorized:
+            ttk.Label(
+                sections,
+                text="Operation-plan resizing requires Job Planner authorization.",
+                style="Subheading.TLabel",
+            ).grid(
+                row=(len(actions) + 2) // 3,
+                column=0,
+                columnspan=3,
+                sticky="w",
+                padx=6,
+                pady=(8, 0),
+            )
 
         statuses = ttk.LabelFrame(content, text="Section Status", padding=16)
         statuses.pack(fill="x", pady=(18, 0))
@@ -1424,6 +1745,139 @@ class JobTravelerApp:
         ttk.Button(
             buttons, text="Home", style="Action.TButton", command=self.show_home
         ).pack(side="left", padx=(10, 0))
+
+    def _adopt_resize_result(self, result, message):
+        self.current_snapshot = result.snapshot
+        self.current_job = copy.deepcopy(result.snapshot.traveler)
+        self.current_path = result.snapshot.location
+        messagebox.showinfo("Operation Plan", message, parent=self.root)
+        self.show_job_detail()
+
+    def show_resize_plan(self):
+        if not self.service_mode or not self.job_planner_authorized:
+            messagebox.showinfo(
+                "Job Planner Required",
+                "Operation-plan resizing requires Job Planner authorization.",
+                parent=self.root,
+            )
+            self.show_job_detail()
+            return
+        if self.current_snapshot is None:
+            self.show_job_detail()
+            return
+        self.clear_screen()
+        frame = ttk.Frame(self.root, style="App.TFrame", padding=SPACE_SECTION)
+        frame.pack(fill="both", expand=True)
+        self.page_header(
+            frame,
+            "Resize Operation Plan",
+            "Surviving operations retain their stable identities.",
+        )
+        current_count = normalized_job(self.current_job)["programming"][
+            "operation_count"
+        ]
+        form = ttk.LabelFrame(frame, text="Operation Count", padding=SPACE_GROUP)
+        form.pack(fill="x")
+        ttk.Label(form, text="Current count:", style="Field.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 16), pady=7
+        )
+        ttk.Label(form, text=str(current_count), style="Value.TLabel").grid(
+            row=0, column=1, sticky="w", pady=7
+        )
+        ttk.Label(form, text="Desired count:", style="Field.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(0, 16), pady=7
+        )
+        desired = ttk.Entry(form, width=16)
+        desired.insert(0, str(current_count))
+        desired.grid(row=1, column=1, sticky="w", pady=7)
+
+        def resize():
+            try:
+                desired_count = parse_positive_integer(
+                    desired.get(), "Desired operation count"
+                )
+            except ValidationError as error:
+                messagebox.showerror(
+                    "Invalid Operation Count", str(error), parent=self.root
+                )
+                return
+            base = self.current_snapshot
+            try:
+                result = self.persistence.resize_plan(base, desired_count)
+            except PlanResizeConfirmationRequired as confirmation:
+                lines = []
+                for item in confirmation.removed_operations:
+                    sections = ", ".join(item.get("meaningful_sections", ()))
+                    detail = f"; entered data in {sections}" if sections else ""
+                    lines.append(f"Operation {item['operation_number']}{detail}")
+                approved = messagebox.askyesno(
+                    "Confirm Destructive Shrink",
+                    "The latest plan would permanently remove:\n\n"
+                    + "\n".join(lines)
+                    + "\n\nRemove exactly these operations?",
+                    default=messagebox.NO,
+                    icon="warning",
+                    parent=self.root,
+                )
+                if not approved:
+                    return
+                try:
+                    result = self.persistence.resize_plan(
+                        base,
+                        desired_count,
+                        confirm_removed_operation_ids=confirmation.operation_ids,
+                    )
+                except PlanResizeConflict as conflict:
+                    self.current_snapshot = conflict.latest_snapshot
+                    self.current_job = copy.deepcopy(
+                        conflict.latest_snapshot.traveler
+                    )
+                    self.current_path = conflict.latest_snapshot.location
+                    messagebox.showwarning(
+                        "Plan Changed",
+                        "The traveler changed before confirmation. Review the latest plan.",
+                        parent=self.root,
+                    )
+                    self.show_job_detail()
+                    return
+                except PersistenceError as error:
+                    messagebox.showerror(
+                        "Resize Failed", str(error), parent=self.root
+                    )
+                    return
+            except PlanResizeConflict as conflict:
+                self.current_snapshot = conflict.latest_snapshot
+                self.current_job = copy.deepcopy(conflict.latest_snapshot.traveler)
+                self.current_path = conflict.latest_snapshot.location
+                messagebox.showwarning(
+                    "Plan Changed",
+                    "The operation plan changed. Review the latest traveler.",
+                    parent=self.root,
+                )
+                self.show_job_detail()
+                return
+            except PersistenceError as error:
+                messagebox.showerror("Resize Failed", str(error), parent=self.root)
+                return
+            self._adopt_resize_result(
+                result,
+                "Operation plan resized."
+                if result.changed
+                else "The operation plan was already at that count.",
+            )
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(20, 0))
+        ttk.Button(
+            buttons, text="Resize Plan", style="Primary.TButton", command=resize
+        ).pack(side="right")
+        ttk.Button(
+            buttons,
+            text="Cancel",
+            style="Action.TButton",
+            command=self.show_job_detail,
+        ).pack(side="right", padx=(0, 10))
+        desired.focus_set()
 
     def _show_section_form(self, title, section_name, field_specs, save_callback):
         self.clear_screen()
@@ -1523,6 +1977,8 @@ class JobTravelerApp:
         count = ttk.Entry(form, width=16)
         count.insert(0, str(programming["operation_count"]))
         count.grid(row=1, column=1, sticky="w", pady=7)
+        if self.service_mode:
+            count.state(["readonly"])
         form.columnconfigure(1, weight=1)
 
         operations_frame = ttk.Frame(content, style="App.TFrame")
@@ -1569,6 +2025,8 @@ class JobTravelerApp:
                     if kind == "combo":
                         widget = ttk.Combobox(card, values=choices, state="readonly", width=55)
                         widget.set(str(saved.get(key, "")))
+                        if self.service_mode and key in {"operation_type", "status"}:
+                            widget.state(["disabled"])
                     elif kind == "notes":
                         widget = tk.Text(
                             card,
@@ -1596,9 +2054,20 @@ class JobTravelerApp:
                 return
             render_operations(desired_count, collect_operations())
 
-        ttk.Button(form, text="Update Operation Editor", command=refresh_editor).grid(
-            row=1, column=1, sticky="e", pady=7
-        )
+        if self.service_mode:
+            ttk.Label(
+                form,
+                text=(
+                    "Use Resize Operation Plan from the job screen to change this count."
+                    if self.job_planner_authorized
+                    else "Changing this count requires Job Planner authorization."
+                ),
+                style="Subheading.TLabel",
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 7))
+        else:
+            ttk.Button(form, text="Update Operation Editor", command=refresh_editor).grid(
+                row=1, column=1, sticky="e", pady=7
+            )
         render_operations(programming["operation_count"])
 
         def save_section():
@@ -1617,32 +2086,35 @@ class JobTravelerApp:
                     parent=self.root,
                 )
                 return
-            confirm_removal = False
-            if desired_count < programming["operation_count"]:
-                confirm_removal = messagebox.askyesno(
-                    "Reduce Operations",
-                    "Remove the unused operation(s)? Production and inspection "
-                    "data will never be deleted.",
-                    parent=self.root,
-                )
-                if not confirm_removal:
-                    return
             try:
-                apply_programming_update(
-                    candidate,
-                    {
-                        "programmer": programmer.get(),
-                        "operation_count": str(desired_count),
-                        "operations": collect_operations(),
-                        "confirm_removal": confirm_removal,
-                    },
-                )
+                values = {
+                    "programmer": programmer.get(),
+                    "operation_count": str(desired_count),
+                    "operations": collect_operations(),
+                }
+                if self.service_mode:
+                    apply_service_programming_update(candidate, values)
+                else:
+                    confirm_removal = False
+                    if desired_count < programming["operation_count"]:
+                        confirm_removal = messagebox.askyesno(
+                            "Reduce Operations",
+                            "Remove the unused operation(s)? Production and inspection "
+                            "data will never be deleted.",
+                            default=messagebox.NO,
+                            parent=self.root,
+                        )
+                        if not confirm_removal:
+                            return
+                    values["confirm_removal"] = confirm_removal
+                    apply_programming_update(candidate, values)
             except ValidationError as error:
                 messagebox.showerror("Invalid Programming", str(error), parent=self.root)
                 return
             save_action = (
                 "plan_resize"
-                if desired_count != programming["operation_count"]
+                if not self.service_mode
+                and desired_count != programming["operation_count"]
                 else "logical_save"
             )
             if self._persist_candidate(
@@ -1708,12 +2180,20 @@ class JobTravelerApp:
             ),
         }
         title, specs = configurations[section_name]
+        if self.service_mode:
+            specs = tuple(spec for spec in specs if spec[0] != "status")
         self._show_section_form(
             title,
             section_name,
             specs,
-            lambda job, values: apply_standard_section_update(
-                job, section_name, values
+            (
+                lambda job, values: apply_service_standard_section_update(
+                    job, section_name, values
+                )
+                if self.service_mode
+                else lambda job, values: apply_standard_section_update(
+                    job, section_name, values
+                )
             ),
         )
 
@@ -1769,6 +2249,8 @@ class JobTravelerApp:
         ).grid(row=4, column=0, sticky="w", padx=(0, 16), pady=8)
         quantity = ttk.Entry(form, width=60)
         quantity.grid(row=4, column=1, sticky="ew", pady=8)
+        if self.service_mode:
+            quantity.state(["disabled"])
         ttk.Label(form, text="Required Quantity:", style="Field.TLabel").grid(
             row=5, column=0, sticky="w", padx=(0, 16), pady=8
         )
@@ -1826,22 +2308,28 @@ class JobTravelerApp:
         def save_section():
             candidate = copy.deepcopy(self.current_job)
             try:
-                updated = apply_cnc_update(
-                    candidate,
-                    {
-                        "operator": operator.get(),
-                        "machine": machine.get(),
-                        "qty_complete": quantity.get(),
-                        "operation_number": selected_number(),
-                        "notes": notes.get("1.0", "end-1c"),
-                    },
+                values = {
+                    "operator": operator.get(),
+                    "machine": machine.get(),
+                    "qty_complete": quantity.get(),
+                    "operation_number": selected_number(),
+                    "notes": notes.get("1.0", "end-1c"),
+                }
+                updated = (
+                    apply_service_cnc_update(candidate, values)
+                    if self.service_mode
+                    else apply_cnc_update(candidate, values)
                 )
             except ValidationError as error:
                 messagebox.showerror("Invalid CNC Update", str(error), parent=self.root)
                 return
             if self._persist_candidate(
                 candidate,
-                f"CNC Machining saved with status: {updated['status']}."
+                (
+                    "CNC Machining ordinary fields saved."
+                    if self.service_mode
+                    else f"CNC Machining saved with status: {updated['status']}."
+                ),
             ):
                 self.show_job_detail()
 
@@ -1917,6 +2405,8 @@ class JobTravelerApp:
             form, values=terminal_app.ALLOWED_STATUSES, state="readonly", width=58
         )
         status.grid(row=6, column=1, sticky="ew", pady=7)
+        if self.service_mode:
+            status.state(["disabled"])
         ttk.Label(form, text="Notes:", style="Field.TLabel").grid(
             row=7, column=0, sticky="nw", padx=(0, 16), pady=7
         )
@@ -1972,7 +2462,11 @@ class JobTravelerApp:
 
         def validated_candidate():
             candidate = copy.deepcopy(self.current_job)
-            apply_inspection_update(candidate, inspection_values())
+            values = inspection_values()
+            if self.service_mode:
+                apply_service_inspection_update(candidate, values)
+            else:
+                apply_inspection_update(candidate, values)
             return candidate
 
         def save_section():
@@ -1985,6 +2479,13 @@ class JobTravelerApp:
                 self.show_job_detail()
 
         def save_and_open_dimensions():
+            if self.service_mode:
+                messagebox.showinfo(
+                    "Dimensions Unavailable",
+                    "Inspection dimension mutations are not available in service mode.",
+                    parent=self.root,
+                )
+                return
             try:
                 candidate = validated_candidate()
             except ValidationError as error:
@@ -1998,12 +2499,13 @@ class JobTravelerApp:
         ttk.Button(
             buttons, text="Save Section", style="Primary.TButton", command=save_section
         ).pack(side="right")
-        ttk.Button(
-            buttons,
-            text="Save & Edit Dimensions",
-            style="Primary.TButton",
-            command=save_and_open_dimensions,
-        ).pack(side="right", padx=(0, 10))
+        if not self.service_mode:
+            ttk.Button(
+                buttons,
+                text="Save & Edit Dimensions",
+                style="Primary.TButton",
+                command=save_and_open_dimensions,
+            ).pack(side="right", padx=(0, 10))
         ttk.Button(
             buttons,
             text="Cancel",
@@ -2012,6 +2514,14 @@ class JobTravelerApp:
         ).pack(side="left")
 
     def show_dimensions(self, operation_number=1):
+        if self.service_mode:
+            messagebox.showinfo(
+                "Dimensions Unavailable",
+                "Inspection dimension mutations are not available in service mode.",
+                parent=self.root,
+            )
+            self.show_job_detail()
+            return
         normalized = normalized_job(self.current_job)
         record = terminal_app.operation_by_number(
             normalized["inspection"]["records"], operation_number
@@ -2477,7 +2987,22 @@ class JobTravelerApp:
 def main():
     """Create and run the native Windows Job Traveler GUI."""
     root = tk.Tk()
-    JobTravelerApp(root)
+    try:
+        selected_mode = os.environ.get(MODE_ENV, "local")
+        session_manager = (
+            build_session_manager_from_environment()
+            if selected_mode.casefold() == "service"
+            else None
+        )
+        JobTravelerApp(root, session_manager=session_manager)
+    except (SessionConfigurationError, PersistenceConfigurationError, TravelerClientError) as error:
+        messagebox.showerror(
+            "ShopOS Configuration",
+            f"The selected Job Traveler mode is unavailable:\n\n{error}",
+            parent=root,
+        )
+        root.destroy()
+        return
     root.mainloop()
 
 

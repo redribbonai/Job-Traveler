@@ -15,7 +15,7 @@ from typing import Any
 
 
 DOMAIN_CONTRACT_NAME = "rr-shopos-job-traveler"
-DOMAIN_CONTRACT_VERSION = 2
+DOMAIN_CONTRACT_VERSION = 3
 
 BLANK = "__________"
 SECTIONS = [
@@ -43,6 +43,16 @@ TURNING_MACHINES = [
     "Puma TT 1300 SYYB",
 ]
 ALL_MACHINES = MILLING_MACHINES + TURNING_MACHINES
+MAX_OPERATION_COUNT = 100
+CREATION_HEADER_FIELDS = (
+    "job_number",
+    "customer",
+    "part_number",
+    "description",
+    "qty_to_make",
+    "material",
+    "cut_length",
+)
 
 SHOPOS_METADATA_KEY = "_shopos"
 SHOPOS_OPERATION_IDENTITIES_KEY = "operation_identities"
@@ -603,6 +613,184 @@ def operation_has_data(
         if value not in ("", None, 0, "Pending", []):
             return True
     return False
+
+
+def _creation_text(value: object, label: str, *, maximum: int = 500) -> str:
+    if not isinstance(value, str):
+        raise TravelerValidationError(f"{label} must be text.")
+    cleaned = value.strip()
+    if (
+        not cleaned
+        or len(cleaned) > maximum
+        or any(ord(character) < 32 for character in cleaned)
+    ):
+        raise TravelerValidationError(f"{label} is invalid.")
+    return cleaned
+
+
+def build_new_traveler(
+    header: object, section_inputs: object, operation_count: object
+) -> dict[str, Any]:
+    """Construct the only accepted new-traveler shape from typed inputs."""
+    if not isinstance(header, dict) or set(header) != set(CREATION_HEADER_FIELDS):
+        raise TravelerValidationError("The traveler header is invalid.")
+    if not isinstance(section_inputs, dict) or set(section_inputs) != set(SECTIONS):
+        raise TravelerValidationError("The traveler section inputs are invalid.")
+    if (
+        isinstance(operation_count, bool)
+        or not isinstance(operation_count, int)
+        or not 1 <= operation_count <= MAX_OPERATION_COUNT
+    ):
+        raise TravelerValidationError("The operation count is invalid.")
+
+    quantity = header["qty_to_make"]
+    if (
+        isinstance(quantity, bool)
+        or not isinstance(quantity, int)
+        or not 1 <= quantity <= (2**63) - 1
+    ):
+        raise TravelerValidationError("Quantity to make is invalid.")
+    candidate: dict[str, Any] = {
+        "job_number": _creation_text(header["job_number"], "Job number", maximum=64),
+        "customer": _creation_text(header["customer"], "Customer"),
+        "part_number": _creation_text(header["part_number"], "Part number"),
+        "description": _creation_text(
+            header["description"], "Description", maximum=4_000
+        ),
+        "qty_to_make": quantity,
+        "material": _creation_text(header["material"], "Material"),
+        "cut_length": _creation_text(header["cut_length"], "Cut length"),
+    }
+    for section in SECTIONS:
+        raw = section_inputs[section]
+        allowed = SECTION_EDITABLE_FIELDS.get(section, {})
+        if not isinstance(raw, dict) or set(raw) - set(allowed):
+            raise TravelerValidationError(
+                f"The initial {section} fields are invalid."
+            )
+        cleaned: dict[str, Any] = {}
+        for field, value in raw.items():
+            rule = allowed[field]
+            if rule == "quantity":
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise TravelerValidationError(
+                        f"The initial {section}.{field} value is invalid."
+                    )
+                cleaned[field] = value
+            else:
+                if not isinstance(value, str) or len(value) > (
+                    4_000 if rule == "notes" else 500
+                ):
+                    raise TravelerValidationError(
+                        f"The initial {section}.{field} value is invalid."
+                    )
+                if any(
+                    ord(character) < 32 and character not in "\n\r\t"
+                    for character in value
+                ):
+                    raise TravelerValidationError(
+                        f"The initial {section}.{field} value is invalid."
+                    )
+                cleaned[field] = value.strip()
+        candidate[section] = cleaned
+
+    canonical = canonical_job(candidate)
+    if operation_count != 1:
+        canonical = resize_operation_plan_structural(canonical, operation_count)
+    validate_traveler_structure(canonical)
+    return canonical
+
+
+def resize_operation_plan_structural(
+    job: dict[str, Any], new_count: int
+) -> dict[str, Any]:
+    """Resize only the machining tail after external conflict/confirmation checks."""
+    if (
+        isinstance(new_count, bool)
+        or not isinstance(new_count, int)
+        or not 1 <= new_count <= MAX_OPERATION_COUNT
+    ):
+        raise TravelerValidationError("The operation count is invalid.")
+    validate_traveler_structure(job)
+    normalized = canonical_job(job)
+    programming = normalized["programming"]
+    old_count = programming["operation_count"]
+    if new_count < old_count:
+        programming["operations"] = programming["operations"][:new_count]
+        normalized["cnc_machining"]["operations"] = [
+            row
+            for row in normalized["cnc_machining"]["operations"]
+            if row.get("operation_number", 0) <= new_count
+        ]
+        normalized["inspection"]["records"] = [
+            row
+            for row in normalized["inspection"]["records"]
+            if row.get("operation_number", 0) <= new_count
+        ]
+    elif new_count > old_count:
+        while len(programming["operations"]) < new_count:
+            programming["operations"].append(
+                blank_programming_operation(len(programming["operations"]) + 1)
+            )
+        while len(normalized["cnc_machining"]["operations"]) < new_count:
+            normalized["cnc_machining"]["operations"].append(
+                blank_cnc_operation(
+                    len(normalized["cnc_machining"]["operations"]) + 1
+                )
+            )
+    programming["operation_count"] = new_count
+    validate_traveler_structure(normalized)
+    return normalized
+
+
+def operation_removal_summary(
+    job: dict[str, Any], new_count: int, missing_identity_factory=None
+) -> list[dict[str, Any]]:
+    """Describe a tail shrink without returning entered field values."""
+    validate_traveler_structure(job)
+    normalized = canonical_job(job)
+    old_count = normalized["programming"]["operation_count"]
+    if (
+        isinstance(new_count, bool)
+        or not isinstance(new_count, int)
+        or not 1 <= new_count < old_count
+    ):
+        raise TravelerValidationError("The requested shrink is invalid.")
+    identities = stable_identity_projection(normalized)["machining_operations"]
+    summaries: list[dict[str, Any]] = []
+    for number in range(new_count + 1, old_count + 1):
+        identity = identities.get(str(number))
+        if identity is None:
+            if missing_identity_factory is None:
+                raise TravelerValidationError(
+                    "A removed operation does not have a stable identity."
+                )
+            identity = _canonical_uuid(
+                missing_identity_factory(number),
+                f"Confirmation identity for machining operation {number}",
+            )
+        meaningful_sections: list[str] = []
+        programming = operation_by_number(
+            normalized["programming"]["operations"], number
+        )
+        cnc = operation_by_number(normalized["cnc_machining"]["operations"], number)
+        inspection = operation_by_number(normalized["inspection"]["records"], number)
+        for section, row in (
+            ("programming", programming),
+            ("cnc_machining", cnc),
+            ("inspection", inspection),
+        ):
+            if operation_has_data(row):
+                meaningful_sections.append(section)
+        summaries.append(
+            {
+                "operation_number": number,
+                "operation_id": identity,
+                "contains_meaningful_data": bool(meaningful_sections),
+                "meaningful_sections": meaningful_sections,
+            }
+        )
+    return summaries
 
 
 def resize_operation_plan(
@@ -1187,6 +1375,7 @@ __all__ = [
     "DOMAIN_CONTRACT_NAME",
     "DOMAIN_CONTRACT_VERSION",
     "MILLING_MACHINES",
+    "MAX_OPERATION_COUNT",
     "SECTIONS",
     "SECTION_EDITABLE_FIELDS",
     "OPERATION_EDITABLE_FIELDS",
@@ -1195,6 +1384,7 @@ __all__ = [
     "TURNING_MACHINES",
     "TravelerValidationError",
     "apply_ordinary_field_change",
+    "build_new_traveler",
     "blank_cnc_operation",
     "blank_if_missing",
     "blank_programming_operation",
@@ -1214,12 +1404,14 @@ __all__ = [
     "operation_by_number",
     "operation_descriptors",
     "operation_reference_contract",
+    "operation_removal_summary",
     "operation_has_data",
     "operation_if_missing",
     "ordinary_field_state",
     "parts_count_projection",
     "read_model",
     "resize_operation_plan",
+    "resize_operation_plan_structural",
     "section_statuses",
     "stable_identity_projection",
     "status_if_missing",
