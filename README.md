@@ -56,7 +56,7 @@ saved after an actual workflow update.
 ### Shared domain contract
 
 `traveler_domain.py` is the single pure compatibility contract shared by the
-terminal application, Tkinter application, and the ShopOS read service. It owns
+terminal application, Tkinter application, and ShopOS services. It owns
 the seven section names, allowed statuses and operation types, official machine
 lists, legacy/current normalization, canonical save representation, operation
 resizing, structural validation, status derivation, and read-model helpers. It
@@ -78,10 +78,43 @@ normalizing those protected structures away. The desktop normalizer retains its
 older permissive direct-call behavior for compatibility; storage/API consumers
 must validate before normalizing untrusted files.
 
-Operation references emitted by the read model are derived from section plus
-the current positional operation number. They are explicitly temporary
-compatibility coordinates, not stable UUIDs. No identifier, revision, closure,
-Task, or `_shopos` metadata is persisted in this phase.
+Contract version 2 also owns the pure validation and projection rules used by
+the disabled ShopOS ordinary-field mutation service. Legacy travelers still
+emit temporary compatibility coordinates and behave as document revision zero;
+reading, viewing, printing, or normalizing them never creates metadata.
+
+On the first successful confirmed server mutation, ShopOS may persist one
+namespaced compatibility object:
+
+```text
+_shopos.document_revision
+_shopos.last_applied_mutation_id
+_shopos.operation_identities.machining_operations
+_shopos.operation_identities.sections
+```
+
+The operation values are server-generated canonical UUIDs. One machining UUID
+is shared by the corresponding Programming, CNC Machining, and inspection
+descriptors; fixed sections also have stable section identities. Duplicate,
+malformed, or conflicting UUIDs are rejected. Unknown compatible top-level,
+section, operation, and `_shopos` values remain intact. Desktop canonical saves
+preserve this metadata, but desktop writers do not yet advance revisions or
+participate in server conflict detection.
+
+The ordinary-field contract permits names, program name/revision, official CNC
+machine selection, notes, nonnegative non-CNC section quantities, and existing
+shipping details. It does not permit job identity, `_shopos`, UUIDs, operation
+numbers/list structure, statuses, closure, dimensions, Tasks, or assignments.
+Conflicts are scoped to the selected field through a deterministic value hash;
+unrelated-field changes do not conflict. A deliberate replacement still must
+submit the latest value hash and conflicts again if that field changed twice.
+
+The reserved future `_shopos.closure_state` value may be read as `open` or
+`closed`, but this phase never creates it. A valid `closed` marker makes employee
+mutation read-only. There are no Tasks, assignments, employee edit-history
+timeline, rollback snapshots, or closure commands. Production mutation remains
+prohibited until the desktop writers participate in revisions and the controlled
+deployment is explicitly approved.
 
 Scrap, reject, and fail numbers are not printed on the public traveler. They may be used later for private boss reports.
 

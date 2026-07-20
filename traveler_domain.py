@@ -7,12 +7,15 @@ Normalization always returns a deep copy and never persists its result.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
+import uuid
 from typing import Any
 
 
 DOMAIN_CONTRACT_NAME = "rr-shopos-job-traveler"
-DOMAIN_CONTRACT_VERSION = 1
+DOMAIN_CONTRACT_VERSION = 2
 
 BLANK = "__________"
 SECTIONS = [
@@ -41,9 +44,286 @@ TURNING_MACHINES = [
 ]
 ALL_MACHINES = MILLING_MACHINES + TURNING_MACHINES
 
+SHOPOS_METADATA_KEY = "_shopos"
+SHOPOS_OPERATION_IDENTITIES_KEY = "operation_identities"
+SHOPOS_DOCUMENT_REVISION_KEY = "document_revision"
+SHOPOS_LAST_MUTATION_KEY = "last_applied_mutation_id"
+SHOPOS_CLOSURE_STATE_KEY = "closure_state"
+
+# These are ordinary value edits only.  Status/workflow transitions, operation-plan
+# changes, identities, and Parts Count-owned values intentionally are not included.
+SECTION_EDITABLE_FIELDS = {
+    "programming": {"programmer": "text"},
+    "saw_cutting": {
+        "employee": "text",
+        "qty_cut": "quantity",
+        "cut_length": "text",
+        "scrap_qty": "quantity",
+        "notes": "notes",
+    },
+    "deburr": {
+        "employee": "text",
+        "deburr_needed": "text",
+        "qty_deburred": "quantity",
+        "notes": "notes",
+    },
+    "packing": {
+        "employee": "text",
+        "qty_packed": "quantity",
+        "box_count": "quantity",
+        "notes": "notes",
+    },
+    "shipping": {
+        "employee": "text",
+        "ship_date": "text",
+        "carrier": "text",
+        "tracking": "text",
+        "notes": "notes",
+    },
+}
+OPERATION_EDITABLE_FIELDS = {
+    "programming": {
+        "program_name": "text",
+        "revision": "text",
+        "notes": "notes",
+    },
+    "cnc_machining": {
+        "operator": "text",
+        "machine": "machine",
+        "notes": "notes",
+    },
+    "inspection": {
+        "inspector": "text",
+        "report_type": "text",
+        "notes": "notes",
+    },
+}
+PROTECTED_MUTATION_FIELDS = frozenset(
+    {
+        "job_number",
+        "job_num",
+        SHOPOS_METADATA_KEY,
+        "operation_number",
+        "operation_count",
+        "operations",
+        "records",
+        "status",
+        "last_updated",
+        "operation_type",
+        "qty_complete",
+        "qty_completed",
+        "parts_completed",
+        "part_total",
+        "dimensions",
+        "closure",
+        "closed",
+        "tasks",
+        "assignments",
+    }
+)
+
 
 class TravelerValidationError(ValueError):
     """Raised when a protected traveler structure is unsafe to interpret."""
+
+
+def _canonical_uuid(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise TravelerValidationError(f"{label} must be a canonical UUID.")
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, AttributeError) as error:
+        raise TravelerValidationError(f"{label} must be a canonical UUID.") from error
+    if value != canonical:
+        raise TravelerValidationError(f"{label} must be a canonical UUID.")
+    return canonical
+
+
+def _metadata(job: dict[str, Any]) -> dict[str, Any]:
+    value = job.get(SHOPOS_METADATA_KEY)
+    return value if isinstance(value, dict) else {}
+
+
+def document_revision(job: object) -> int:
+    """Return the persisted ShopOS revision; legacy travelers are revision zero."""
+    if not isinstance(job, dict):
+        raise TravelerValidationError("The Job Traveler file must contain a JSON object.")
+    metadata = job.get(SHOPOS_METADATA_KEY)
+    if metadata is None:
+        return 0
+    if not isinstance(metadata, dict):
+        raise TravelerValidationError("_shopos must contain a JSON object.")
+    value = metadata.get(SHOPOS_DOCUMENT_REVISION_KEY, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TravelerValidationError(
+            "_shopos.document_revision must be a non-negative whole number."
+        )
+    return value
+
+
+def last_applied_mutation_id(job: object) -> str | None:
+    if not isinstance(job, dict):
+        raise TravelerValidationError("The Job Traveler file must contain a JSON object.")
+    metadata = job.get(SHOPOS_METADATA_KEY)
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise TravelerValidationError("_shopos must contain a JSON object.")
+    value = metadata.get(SHOPOS_LAST_MUTATION_KEY)
+    if value is None:
+        return None
+    return _canonical_uuid(value, "_shopos.last_applied_mutation_id")
+
+
+def is_authoritatively_closed(job: object) -> bool:
+    """Recognize, but never create, the reserved future closure marker."""
+    if not isinstance(job, dict):
+        raise TravelerValidationError("The Job Traveler file must contain a JSON object.")
+    metadata = job.get(SHOPOS_METADATA_KEY)
+    if metadata is None:
+        return False
+    if not isinstance(metadata, dict):
+        raise TravelerValidationError("_shopos must contain a JSON object.")
+    value = metadata.get(SHOPOS_CLOSURE_STATE_KEY)
+    if value is None:
+        return False
+    if value not in ("open", "closed"):
+        raise TravelerValidationError(
+            "_shopos.closure_state must be 'open' or 'closed'."
+        )
+    return value == "closed"
+
+
+def _validated_identity_maps(
+    job: dict[str, Any], *, require_complete: bool = False
+) -> tuple[dict[str, str], dict[str, str]]:
+    metadata = _metadata(job)
+    identities = metadata.get(SHOPOS_OPERATION_IDENTITIES_KEY)
+    if identities is None:
+        if require_complete:
+            raise TravelerValidationError("Stable operation identities are missing.")
+        return {}, {}
+    if not isinstance(identities, dict):
+        raise TravelerValidationError("_shopos.operation_identities must be an object.")
+    raw_machining = identities.get("machining_operations", {})
+    raw_sections = identities.get("sections", {})
+    if not isinstance(raw_machining, dict) or not isinstance(raw_sections, dict):
+        raise TravelerValidationError(
+            "Stable operation identity collections must be objects."
+        )
+    machining: dict[str, str] = {}
+    sections: dict[str, str] = {}
+    seen: set[str] = set()
+    for raw_key, raw_value in raw_machining.items():
+        if (
+            not isinstance(raw_key, str)
+            or not raw_key.isdigit()
+            or str(int(raw_key)) != raw_key
+            or int(raw_key) <= 0
+        ):
+            raise TravelerValidationError(
+                "Stable machining identity keys must be positive operation numbers."
+            )
+        identity = _canonical_uuid(
+            raw_value, f"Stable identity for machining operation {raw_key}"
+        )
+        if identity in seen:
+            raise TravelerValidationError("Stable operation identities must be unique.")
+        seen.add(identity)
+        machining[raw_key] = identity
+    for raw_key, raw_value in raw_sections.items():
+        if not isinstance(raw_key, str) or raw_key not in SECTIONS:
+            raise TravelerValidationError("Stable section identity has an invalid section.")
+        identity = _canonical_uuid(raw_value, f"Stable identity for {raw_key}")
+        if identity in seen:
+            raise TravelerValidationError("Stable operation identities must be unique.")
+        seen.add(identity)
+        sections[raw_key] = identity
+    return machining, sections
+
+
+def stable_identity_projection(job: object) -> dict[str, dict[str, str]]:
+    if not isinstance(job, dict):
+        raise TravelerValidationError("The Job Traveler file must contain a JSON object.")
+    machining, sections = _validated_identity_maps(job)
+    return {
+        "machining_operations": copy.deepcopy(machining),
+        "sections": copy.deepcopy(sections),
+    }
+
+
+def bootstrap_stable_identities(job: dict[str, Any], id_factory) -> dict[str, Any]:
+    """Return a copy with missing current identities filled by ``id_factory``.
+
+    This helper does not persist and is never called during a read.  The server
+    invokes it only after an ordinary edit has passed conflict and validation
+    checks, immediately before the confirmed atomic replacement.
+    """
+    validate_traveler_structure(job)
+    candidate = canonical_job(job)
+    metadata = copy.deepcopy(_metadata(candidate))
+    identities = copy.deepcopy(metadata.get(SHOPOS_OPERATION_IDENTITIES_KEY, {}))
+    if not isinstance(identities, dict):
+        raise TravelerValidationError("_shopos.operation_identities must be an object.")
+    machining = copy.deepcopy(identities.get("machining_operations", {}))
+    sections = copy.deepcopy(identities.get("sections", {}))
+    if not isinstance(machining, dict) or not isinstance(sections, dict):
+        raise TravelerValidationError(
+            "Stable operation identity collections must be objects."
+        )
+
+    for operation in candidate["programming"]["operations"]:
+        key = str(operation["operation_number"])
+        if key not in machining:
+            machining[key] = _canonical_uuid(
+                id_factory(), f"Stable identity for machining operation {key}"
+            )
+    for section in SECTIONS:
+        if section not in sections:
+            sections[section] = _canonical_uuid(
+                id_factory(), f"Stable identity for {section}"
+            )
+    identities["machining_operations"] = machining
+    identities["sections"] = sections
+    metadata[SHOPOS_OPERATION_IDENTITIES_KEY] = identities
+    candidate[SHOPOS_METADATA_KEY] = metadata
+    _validated_identity_maps(candidate, require_complete=True)
+    return candidate
+
+
+def confirm_mutation_metadata(
+    job: dict[str, Any], *, prior_revision: int, mutation_id: str
+) -> dict[str, Any]:
+    """Add the one confirmed server revision while preserving private metadata."""
+    if (
+        isinstance(prior_revision, bool)
+        or not isinstance(prior_revision, int)
+        or prior_revision < 0
+    ):
+        raise TravelerValidationError("The prior revision is invalid.")
+    canonical_mutation_id = _canonical_uuid(mutation_id, "Mutation ID")
+    candidate = copy.deepcopy(job)
+    metadata = copy.deepcopy(_metadata(candidate))
+    metadata[SHOPOS_DOCUMENT_REVISION_KEY] = prior_revision + 1
+    metadata[SHOPOS_LAST_MUTATION_KEY] = canonical_mutation_id
+    candidate[SHOPOS_METADATA_KEY] = metadata
+    validate_traveler_structure(candidate)
+    return candidate
+
+
+def deterministic_value_hash(value: Any) -> str:
+    """Hash one finite JSON value for same-field optimistic concurrency."""
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise TravelerValidationError("The field value is not valid finite JSON.") from error
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def blank_programming_operation(operation_number: int) -> dict[str, Any]:
@@ -513,6 +793,22 @@ def _validate_operation_rows(section: dict[str, Any], key: str, label: str) -> N
         seen.add(number)
 
 
+def _validate_shopos_metadata(job: dict[str, Any]) -> None:
+    metadata = job.get(SHOPOS_METADATA_KEY)
+    if metadata is None:
+        return
+    if not isinstance(metadata, dict):
+        raise TravelerValidationError("_shopos must contain a JSON object.")
+    revision = document_revision(job)
+    mutation_id = last_applied_mutation_id(job)
+    if revision == 0 and mutation_id is not None:
+        raise TravelerValidationError(
+            "A last applied mutation ID requires a positive document revision."
+        )
+    _validated_identity_maps(job)
+    is_authoritatively_closed(job)
+
+
 def validate_traveler_structure(value: object) -> None:
     """Validate protected current/legacy structure without normalizing the source."""
     if not isinstance(value, dict):
@@ -544,6 +840,164 @@ def validate_traveler_structure(value: object) -> None:
         _validate_operation_rows(cnc, "operations", "cnc_machining")
     if isinstance(inspection, dict):
         _validate_operation_rows(inspection, "records", "inspection")
+    _validate_shopos_metadata(value)
+
+
+def _editable_field_rule(section: str, field: str) -> tuple[str, str]:
+    if field in PROTECTED_MUTATION_FIELDS or field.startswith("_"):
+        raise TravelerValidationError("The requested field is protected.")
+    if field in SECTION_EDITABLE_FIELDS.get(section, {}):
+        return "section", SECTION_EDITABLE_FIELDS[section][field]
+    if field in OPERATION_EDITABLE_FIELDS.get(section, {}):
+        return "operation", OPERATION_EDITABLE_FIELDS[section][field]
+    raise TravelerValidationError("The requested field is not editable.")
+
+
+def _validate_edit_value(
+    rule: str,
+    value: Any,
+    *,
+    normalized_job: dict[str, Any],
+    operation_number: int | None,
+) -> Any:
+    if rule in ("text", "notes"):
+        if not isinstance(value, str):
+            raise TravelerValidationError("The new field value must be text.")
+        maximum = 4_000 if rule == "notes" else 500
+        if len(value) > maximum or any(
+            ord(character) < 32 and character not in "\n\r\t" for character in value
+        ):
+            raise TravelerValidationError("The new field value is invalid.")
+        return value.strip()
+    if rule == "quantity":
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TravelerValidationError(
+                "The new field value must be a non-negative whole number."
+            )
+        return value
+    if rule == "machine":
+        if value not in ALL_MACHINES:
+            raise TravelerValidationError("The selected machine is not permitted.")
+        if operation_number is None:
+            raise TravelerValidationError("A machine requires a machining operation.")
+        programming = operation_by_number(
+            normalized_job["programming"]["operations"], operation_number
+        ) or {}
+        operation_type = programming.get("operation_type")
+        allowed = (
+            MILLING_MACHINES
+            if operation_type == "Mill"
+            else TURNING_MACHINES if operation_type == "Turning" else []
+        )
+        if value not in allowed:
+            raise TravelerValidationError(
+                "The selected machine does not match the programmed operation type."
+            )
+        return value
+    raise TravelerValidationError("The editable-field rule is invalid.")
+
+
+def _resolve_target(
+    job: dict[str, Any], target: object
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(target, dict):
+        raise TravelerValidationError("The mutation target must be an object.")
+    if set(target) not in (
+        {"section", "field", "operation_id"},
+        {"section", "field", "compatibility_reference"},
+    ):
+        raise TravelerValidationError(
+            "The mutation target requires section, field, and one operation reference."
+        )
+    section = target.get("section")
+    field = target.get("field")
+    if not isinstance(section, str) or section not in SECTIONS:
+        raise TravelerValidationError("The mutation target section is invalid.")
+    if not isinstance(field, str) or not field or len(field) > 100:
+        raise TravelerValidationError("The mutation target field is invalid.")
+    kind, rule = _editable_field_rule(section, field)
+    normalized = canonical_job(job)
+    machining, sections = _validated_identity_maps(normalized)
+    operation_number: int | None = None
+
+    if "operation_id" in target:
+        identity = _canonical_uuid(target["operation_id"], "Operation ID")
+        if kind == "section":
+            if sections.get(section) != identity:
+                raise TravelerValidationError("The stable operation identity is invalid.")
+        else:
+            matches = [int(number) for number, value in machining.items() if value == identity]
+            if len(matches) != 1:
+                raise TravelerValidationError("The stable operation identity is invalid.")
+            operation_number = matches[0]
+    else:
+        reference = target.get("compatibility_reference")
+        if not isinstance(reference, str):
+            raise TravelerValidationError("The compatibility reference is invalid.")
+        expected_prefix = f"{section}:operation:"
+        if kind == "section":
+            if reference != section:
+                raise TravelerValidationError("The compatibility reference is invalid.")
+        else:
+            if not reference.startswith(expected_prefix):
+                raise TravelerValidationError("The compatibility reference is invalid.")
+            raw_number = reference[len(expected_prefix):]
+            if not raw_number.isdigit() or int(raw_number) <= 0:
+                raise TravelerValidationError("The compatibility reference is invalid.")
+            operation_number = int(raw_number)
+
+    if kind == "section":
+        container = normalized[section]
+    else:
+        key = "records" if section == "inspection" else "operations"
+        container = operation_by_number(normalized[section][key], operation_number or 0)
+        if container is None:
+            raise TravelerValidationError("The referenced operation does not exist.")
+
+    current_value = copy.deepcopy(container.get(field, ""))
+    state = {
+        "section": section,
+        "field": field,
+        "operation_number": operation_number,
+        "value": current_value,
+        "value_hash": deterministic_value_hash(current_value),
+        "target_kind": kind,
+        "validation_rule": rule,
+    }
+    return normalized, {"container": container, "state": state}
+
+
+def ordinary_field_state(job: object, target: object) -> dict[str, Any]:
+    """Return the authoritative current value/hash for one allowed target."""
+    validate_traveler_structure(job)
+    assert isinstance(job, dict)
+    _normalized, resolved = _resolve_target(job, target)
+    state = copy.deepcopy(resolved["state"])
+    state.pop("validation_rule", None)
+    return state
+
+
+def apply_ordinary_field_change(
+    job: object, target: object, new_value: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Apply one allowlisted field change to a canonical copy only."""
+    validate_traveler_structure(job)
+    assert isinstance(job, dict)
+    normalized, resolved = _resolve_target(job, target)
+    state = resolved["state"]
+    confirmed_value = _validate_edit_value(
+        state["validation_rule"],
+        new_value,
+        normalized_job=normalized,
+        operation_number=state["operation_number"],
+    )
+    resolved["container"][state["field"]] = copy.deepcopy(confirmed_value)
+    validate_traveler_structure(normalized)
+    confirmed_state = copy.deepcopy(state)
+    confirmed_state["value"] = copy.deepcopy(confirmed_value)
+    confirmed_state["value_hash"] = deterministic_value_hash(confirmed_value)
+    confirmed_state.pop("validation_rule", None)
+    return normalized, confirmed_state
 
 
 def section_statuses(job: dict[str, Any]) -> dict[str, str]:
@@ -557,23 +1011,28 @@ def _derived_status(value: object) -> str:
 
 
 def operation_descriptors(job: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return deterministic, explicitly temporary operation references.
+    """Return Task-relevant descriptors with stable IDs when already persisted.
 
-    References are compatibility coordinates derived from section and current
-    positional operation number. They are not stable UUIDs and must not be used
-    as permanent Task identities.
+    Legacy travelers retain explicitly temporary compatibility coordinates.  A
+    read never generates or persists identities.
     """
     normalized = normalize_operations(job)
+    machining_identities, section_identities = _validated_identity_maps(normalized)
     programming = normalized["programming"]["operations"]
     cnc = normalized["cnc_machining"]["operations"]
     inspection = normalized["inspection"]["records"]
     descriptors: list[dict[str, Any]] = []
 
     def append_fixed(section: str) -> None:
+        stable_identity = section_identities.get(section)
         descriptors.append(
             {
                 "compatibility_reference": section,
-                "reference_stability": "temporary_positional",
+                "stable_operation_id": stable_identity,
+                "operation_reference": stable_identity or section,
+                "reference_stability": (
+                    "stable_uuid" if stable_identity else "temporary_positional"
+                ),
                 "section": section,
                 "operation_number": None,
                 "operation_type": None,
@@ -584,10 +1043,16 @@ def operation_descriptors(job: dict[str, Any]) -> list[dict[str, Any]]:
 
     for row in programming:
         number = row["operation_number"]
+        stable_identity = machining_identities.get(str(number))
+        compatibility_reference = f"programming:operation:{number}"
         descriptors.append(
             {
-                "compatibility_reference": f"programming:operation:{number}",
-                "reference_stability": "temporary_positional",
+                "compatibility_reference": compatibility_reference,
+                "stable_operation_id": stable_identity,
+                "operation_reference": stable_identity or compatibility_reference,
+                "reference_stability": (
+                    "stable_uuid" if stable_identity else "temporary_positional"
+                ),
                 "section": "programming",
                 "operation_number": number,
                 "operation_type": row.get("operation_type", ""),
@@ -599,10 +1064,16 @@ def operation_descriptors(job: dict[str, Any]) -> list[dict[str, Any]]:
     for row in cnc:
         number = row["operation_number"]
         programming_row = operation_by_number(programming, number) or {}
+        stable_identity = machining_identities.get(str(number))
+        compatibility_reference = f"cnc_machining:operation:{number}"
         descriptors.append(
             {
-                "compatibility_reference": f"cnc_machining:operation:{number}",
-                "reference_stability": "temporary_positional",
+                "compatibility_reference": compatibility_reference,
+                "stable_operation_id": stable_identity,
+                "operation_reference": stable_identity or compatibility_reference,
+                "reference_stability": (
+                    "stable_uuid" if stable_identity else "temporary_positional"
+                ),
                 "section": "cnc_machining",
                 "operation_number": number,
                 "operation_type": programming_row.get("operation_type", ""),
@@ -618,10 +1089,16 @@ def operation_descriptors(job: dict[str, Any]) -> list[dict[str, Any]]:
         number = programming_row["operation_number"]
         row = inspection_by_number.get(number, {})
         cnc_row = operation_by_number(cnc, number) or {}
+        stable_identity = machining_identities.get(str(number))
+        compatibility_reference = f"inspection:operation:{number}"
         descriptors.append(
             {
-                "compatibility_reference": f"inspection:operation:{number}",
-                "reference_stability": "temporary_positional",
+                "compatibility_reference": compatibility_reference,
+                "stable_operation_id": stable_identity,
+                "operation_reference": stable_identity or compatibility_reference,
+                "reference_stability": (
+                    "stable_uuid" if stable_identity else "temporary_positional"
+                ),
                 "section": "inspection",
                 "operation_number": number,
                 "operation_type": row.get(
@@ -636,6 +1113,24 @@ def operation_descriptors(job: dict[str, Any]) -> list[dict[str, Any]]:
     return descriptors
 
 
+def operation_reference_contract(job: object) -> str:
+    """Describe whether the current read model has complete stable identities."""
+    validate_traveler_structure(job)
+    assert isinstance(job, dict)
+    descriptors = operation_descriptors(job)
+    if descriptors and all(
+        descriptor["reference_stability"] == "stable_uuid"
+        for descriptor in descriptors
+    ):
+        return "stable_uuid_v1"
+    if any(
+        descriptor["reference_stability"] == "stable_uuid"
+        for descriptor in descriptors
+    ):
+        return "mixed_compatibility_v1"
+    return "temporary_positional_v1"
+
+
 def read_model(job: object) -> dict[str, Any]:
     """Validate and build the reusable normalized and derived read model."""
     validate_traveler_structure(job)
@@ -645,6 +1140,10 @@ def read_model(job: object) -> dict[str, Any]:
         "normalized": normalized,
         "section_statuses": section_statuses(normalized),
         "operations": operation_descriptors(normalized),
+        "operation_identities": stable_identity_projection(normalized),
+        "document_revision": document_revision(normalized),
+        "operation_reference_contract": operation_reference_contract(normalized),
+        "authoritatively_closed": is_authoritatively_closed(normalized),
     }
 
 
@@ -657,25 +1156,39 @@ __all__ = [
     "DOMAIN_CONTRACT_VERSION",
     "MILLING_MACHINES",
     "SECTIONS",
+    "SECTION_EDITABLE_FIELDS",
+    "OPERATION_EDITABLE_FIELDS",
+    "PROTECTED_MUTATION_FIELDS",
+    "SHOPOS_METADATA_KEY",
     "TURNING_MACHINES",
     "TravelerValidationError",
+    "apply_ordinary_field_change",
     "blank_cnc_operation",
     "blank_if_missing",
     "blank_programming_operation",
+    "bootstrap_stable_identities",
     "canonical_job",
+    "confirm_mutation_metadata",
+    "deterministic_value_hash",
+    "document_revision",
     "get_cnc_status",
     "get_required_quantity",
     "infer_operation_type",
+    "is_authoritatively_closed",
     "job_field",
+    "last_applied_mutation_id",
     "normalize_operations",
     "operation_by_number",
     "operation_descriptors",
+    "operation_reference_contract",
     "operation_has_data",
     "operation_if_missing",
+    "ordinary_field_state",
     "parts_count_projection",
     "read_model",
     "resize_operation_plan",
     "section_statuses",
+    "stable_identity_projection",
     "status_if_missing",
     "validate_traveler_structure",
 ]
