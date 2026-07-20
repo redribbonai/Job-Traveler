@@ -19,6 +19,7 @@ import stat
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -26,6 +27,11 @@ from typing import Any, Callable, Iterable
 from filelock import FileLock, Timeout as FileLockTimeout
 
 import traveler_domain as domain
+from shopos_coordination import (
+    CoordinationError,
+    CoordinationSettings,
+    CoordinationTimeoutError,
+)
 
 
 MODE_ENV = "JOB_TRAVELER_PERSISTENCE_MODE"
@@ -734,6 +740,7 @@ class LocalTravelerPersistence(TravelerPersistence):
         lock_timeout: float | None = 10.0,
         id_factory: Callable[[], str] | None = None,
         hooks: LocalWriteHooks | None = None,
+        coordination: CoordinationSettings | None = None,
     ) -> None:
         if lock_timeout is not None and lock_timeout < 0:
             raise ValueError("Lock timeout must be zero or greater, or None.")
@@ -741,6 +748,26 @@ class LocalTravelerPersistence(TravelerPersistence):
         self.lock_timeout = lock_timeout
         self.id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self.hooks = hooks or LocalWriteHooks()
+        try:
+            self.coordination = coordination or CoordinationSettings.from_environment(
+                timeout_seconds=10.0 if lock_timeout is None else lock_timeout
+            )
+        except CoordinationError as error:
+            raise PersistenceConfigurationError(str(error)) from error
+
+    @contextmanager
+    def _coordinated_writer(self):
+        try:
+            with self.coordination.writer():
+                yield
+        except CoordinationTimeoutError as error:
+            raise PersistenceLockTimeoutError(
+                "ShopOS backup coordination is busy. Try saving again."
+            ) from error
+        except CoordinationError as error:
+            raise PersistenceStorageError(
+                "ShopOS backup coordination is unavailable."
+            ) from error
 
     def _ensure_root(self) -> Path:
         _assert_test_write_path(self.root / LOCK_DIRECTORY_NAME / "guard", purpose="jobs write")
@@ -980,28 +1007,29 @@ class LocalTravelerPersistence(TravelerPersistence):
             job_number = domain.parts_count_projection(intended)["job_number"]
         except (TypeError, ValueError, RecursionError) as error:
             raise PersistenceValidationError("The intended Job Traveler is invalid.") from error
-        root = self._ensure_root()
-        target = _resolve_direct_target(root, f"{_safe_job_number(job_number)}.json")
-        with _DestinationLock(root, target, self.lock_timeout):
-            _recover_locked(target)
-            if target.exists():
-                if not overwrite:
-                    raise PersistenceAlreadyExistsError("The Job Traveler already exists.")
-                base = _snapshot(target, job_number)
-                return self._save_locked(
-                    target, base, intended, action="logical_save"
-                )
-            try:
-                candidate = domain.bootstrap_stable_identities(intended, self.id_factory)
-                candidate = domain.confirm_local_save_metadata(candidate, prior_revision=0)
-                domain.validate_traveler_structure(candidate)
-            except (TypeError, ValueError, RecursionError) as error:
-                raise PersistenceValidationError("The intended Job Traveler is invalid.") from error
-            self._atomic_replace(target, candidate)
-            confirmed = _snapshot(target, job_number)
-            if confirmed.document_revision != 1:
-                raise PersistenceStorageError("The created traveler could not be confirmed.")
-            return SaveResult(confirmed, changed=True)
+        with self._coordinated_writer():
+            root = self._ensure_root()
+            target = _resolve_direct_target(root, f"{_safe_job_number(job_number)}.json")
+            with _DestinationLock(root, target, self.lock_timeout):
+                _recover_locked(target)
+                if target.exists():
+                    if not overwrite:
+                        raise PersistenceAlreadyExistsError("The Job Traveler already exists.")
+                    base = _snapshot(target, job_number)
+                    return self._save_locked(
+                        target, base, intended, action="logical_save"
+                    )
+                try:
+                    candidate = domain.bootstrap_stable_identities(intended, self.id_factory)
+                    candidate = domain.confirm_local_save_metadata(candidate, prior_revision=0)
+                    domain.validate_traveler_structure(candidate)
+                except (TypeError, ValueError, RecursionError) as error:
+                    raise PersistenceValidationError("The intended Job Traveler is invalid.") from error
+                self._atomic_replace(target, candidate)
+                confirmed = _snapshot(target, job_number)
+                if confirmed.document_revision != 1:
+                    raise PersistenceStorageError("The created traveler could not be confirmed.")
+                return SaveResult(confirmed, changed=True)
 
     def save(
         self,
@@ -1012,13 +1040,14 @@ class LocalTravelerPersistence(TravelerPersistence):
     ) -> SaveResult:
         if not isinstance(base, TravelerSnapshot) or base.location is None:
             raise PersistenceValidationError("A local save requires its loaded snapshot.")
-        root = _resolve_root(self.root, must_exist=True)
-        target = _resolve_direct_target(root, base.location)
-        with _DestinationLock(root, target, self.lock_timeout):
-            _recover_locked(target)
-            if not target.exists():
-                raise PersistenceNotFoundError("The Job Traveler was not found.")
-            return self._save_locked(target, base, intended, action=action)
+        with self._coordinated_writer():
+            root = _resolve_root(self.root, must_exist=True)
+            target = _resolve_direct_target(root, base.location)
+            with _DestinationLock(root, target, self.lock_timeout):
+                _recover_locked(target)
+                if not target.exists():
+                    raise PersistenceNotFoundError("The Job Traveler was not found.")
+                return self._save_locked(target, base, intended, action=action)
 
 
 def build_persistence(

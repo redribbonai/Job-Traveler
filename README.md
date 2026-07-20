@@ -8,6 +8,14 @@ service client remains non-production, explicit opt-in, and has no local
 fallback. See [PHASE_2C_SERVICE_CLIENT.md](PHASE_2C_SERVICE_CLIENT.md) for the
 mode, conflict, retry, and later-cutover constraints.
 
+Phase 2E adds an optional cross-process backup barrier to local compatibility
+writes. It is disabled unless `SHOP_ENABLE_COORDINATED_BACKUPS=true` and one
+safe absolute `SHOP_COORDINATION_LOCK_PATH` are explicitly supplied to every
+Job Traveler and Parts Count writer. Local create/save acquires that barrier
+before its canonical job lock and fails safely on a bounded timeout; it never
+falls back to an uncoordinated write. No production backup or scheduler is
+enabled by this change.
+
 This app creates digital job travelers for machine shop jobs. Each traveler is saved as a JSON file and can be opened later by job number. Employees can update their section of the traveler, and the app prints a paper-style traveler with blanks for missing fields.
 
 ## Features
