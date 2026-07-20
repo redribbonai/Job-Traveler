@@ -272,6 +272,15 @@ def bootstrap_stable_identities(job: dict[str, Any], id_factory) -> dict[str, An
             "Stable operation identity collections must be objects."
         )
 
+    current_operation_keys = {
+        str(operation["operation_number"])
+        for operation in candidate["programming"]["operations"]
+    }
+    # A confirmed shrink retires only the identities that left the plan.  Keeping
+    # retired keys would make a later expansion recycle an operation identity.
+    machining = {
+        key: value for key, value in machining.items() if key in current_operation_keys
+    }
     for operation in candidate["programming"]["operations"]:
         key = str(operation["operation_number"])
         if key not in machining:
@@ -306,6 +315,29 @@ def confirm_mutation_metadata(
     metadata = copy.deepcopy(_metadata(candidate))
     metadata[SHOPOS_DOCUMENT_REVISION_KEY] = prior_revision + 1
     metadata[SHOPOS_LAST_MUTATION_KEY] = canonical_mutation_id
+    candidate[SHOPOS_METADATA_KEY] = metadata
+    validate_traveler_structure(candidate)
+    return candidate
+
+
+def confirm_local_save_metadata(
+    job: dict[str, Any], *, prior_revision: int
+) -> dict[str, Any]:
+    """Add one confirmed desktop revision without inventing a server request ID.
+
+    A coordinated local compatibility save preserves any previously recorded
+    ``last_applied_mutation_id`` exactly.  Legacy travelers therefore gain only
+    the revision and identity metadata required by their first confirmed save.
+    """
+    if (
+        isinstance(prior_revision, bool)
+        or not isinstance(prior_revision, int)
+        or prior_revision < 0
+    ):
+        raise TravelerValidationError("The prior revision is invalid.")
+    candidate = copy.deepcopy(job)
+    metadata = copy.deepcopy(_metadata(candidate))
+    metadata[SHOPOS_DOCUMENT_REVISION_KEY] = prior_revision + 1
     candidate[SHOPOS_METADATA_KEY] = metadata
     validate_traveler_structure(candidate)
     return candidate
@@ -1168,6 +1200,7 @@ __all__ = [
     "blank_programming_operation",
     "bootstrap_stable_identities",
     "canonical_job",
+    "confirm_local_save_metadata",
     "confirm_mutation_metadata",
     "deterministic_value_hash",
     "document_revision",

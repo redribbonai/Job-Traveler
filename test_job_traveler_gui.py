@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,9 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from unittest import mock
+
+os.environ.setdefault("JOB_TRAVELER_TEST_PROCESS", "job-traveler-tests")
+os.environ.setdefault("JOB_TRAVELER_TEST_WRITE_ROOTS", tempfile.gettempdir())
 
 import job_traveler as terminal_app
 import job_traveler_gui as gui
@@ -414,10 +418,11 @@ class MultiOperationTravelerTests(unittest.TestCase):
 
             gui.save_job_data(normalized, directory)
             canonical = json.loads(path.read_text(encoding="utf-8"))
-            self.assertNotIn("machine", canonical["programming"])
-            self.assertNotIn("first_article", canonical["cnc_machining"])
-            self.assertIn("operations", canonical["cnc_machining"])
-            self.assertNotEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
+            # A canonicalized in-memory view with no user edit is a no-op.  The
+            # persistence boundary must not rewrite or bootstrap legacy bytes.
+            self.assertIn("machine", canonical["programming"])
+            self.assertIn("first_article", canonical["cnc_machining"])
+            self.assertEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
 
     def test_legacy_programming_machine_is_only_fallback_when_cnc_blank(self):
         legacy = self.legacy_job_316_fixture()

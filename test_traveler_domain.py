@@ -6,6 +6,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,9 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
+
+os.environ.setdefault("JOB_TRAVELER_TEST_PROCESS", "job-traveler-tests")
+os.environ.setdefault("JOB_TRAVELER_TEST_WRITE_ROOTS", tempfile.gettempdir())
 
 import job_traveler as terminal_app
 import job_traveler_gui as gui

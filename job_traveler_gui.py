@@ -10,7 +10,6 @@ from __future__ import annotations
 import copy
 import html
 import io
-import json
 import os
 import re
 import tempfile
@@ -23,6 +22,16 @@ from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
 
 import job_traveler as terminal_app
+from traveler_persistence import (
+    MODE_ENV,
+    LocalTravelerPersistence,
+    PersistenceAlreadyExistsError,
+    PersistenceConflict,
+    PersistenceError,
+    TravelerPersistence,
+    build_persistence,
+    set_conflict_value,
+)
 from gui_theme import (
     BACKGROUND,
     BORDER,
@@ -540,44 +549,25 @@ def traveler_path(job_number, jobs_directory=None):
 
 
 def save_job_to_path(job, destination, jobs_directory=None, overwrite=True):
-    """Atomically save a traveler to an existing in-scope JSON path."""
-    data = terminal_app.canonical_job(normalized_job(job))
+    """Compatibility wrapper delegating to the one local persistence adapter."""
     directory = get_jobs_directory(jobs_directory)
     destination = Path(destination).resolve()
     if destination.parent != directory or destination.suffix.casefold() != ".json":
         raise ValidationError("Traveler destination must be a JSON file in the jobs folder.")
-    if destination.exists() and not overwrite:
-        raise FileExistsError(destination)
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary_name = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary_file:
-            temporary_name = Path(temporary_file.name)
-            # Match the TUI's ASCII-safe JSON output so its default-encoding
-            # reader remains compatible on every supported Windows locale.
-            json.dump(data, temporary_file, indent=4, ensure_ascii=True)
-            temporary_file.write("\n")
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-
-        os.replace(temporary_name, destination)
-        temporary_name = None
-    finally:
-        if temporary_name is not None:
-            try:
-                temporary_name.unlink()
-            except OSError:
-                pass
-
-    return destination
+    persistence = LocalTravelerPersistence(directory)
+    if destination.exists():
+        snapshot = persistence.load_path(destination)
+        if not overwrite:
+            raise FileExistsError(destination)
+        result = persistence.save(snapshot, job)
+    else:
+        expected = f"{validate_job_number(job.get('job_number'))}.json"
+        if destination.name != expected:
+            raise ValidationError("Traveler destination must match its job number.")
+        result = persistence.create(job, overwrite=False)
+    job.clear()
+    job.update(copy.deepcopy(result.snapshot.traveler))
+    return result.snapshot.location
 
 
 def save_job_data(job, jobs_directory=None, overwrite=True):
@@ -587,11 +577,9 @@ def save_job_data(job, jobs_directory=None, overwrite=True):
 
 
 def load_job_path(path):
-    """Load and normalize one TUI- or GUI-created traveler."""
+    """Load one traveler through the persistence boundary."""
     path = Path(path)
-    with path.open("r", encoding="utf-8") as traveler_file:
-        job = json.load(traveler_file)
-    return normalized_job(job)
+    return LocalTravelerPersistence(path.parent).load_path(path).traveler
 
 
 def load_job_data(job_number, jobs_directory=None):
@@ -610,32 +598,29 @@ def current_job_status(job):
 
 
 def list_saved_jobs(jobs_directory=None):
-    """Return valid traveler summaries plus unreadable-file diagnostics."""
+    """Compatibility projection of local summaries from the persistence boundary."""
     directory = get_jobs_directory(jobs_directory)
     if not directory.exists():
         return [], []
-
-    travelers = []
-    errors = []
-    for path in sorted(directory.glob("*.json"), key=lambda item: item.name.casefold()):
-        try:
-            job = load_job_path(path)
-        except (OSError, UnicodeError, json.JSONDecodeError, ValidationError) as error:
-            errors.append((path, str(error)))
-            continue
-
-        travelers.append(
-            {
-                "path": path,
-                "job": job,
-                "job_number": job.get("job_number", path.stem),
-                "customer": job.get("customer", ""),
-                "part_number": job.get("part_number", ""),
-                "quantity": job.get("qty_to_make", ""),
-                "status": current_job_status(job),
-            }
-        )
-    return travelers, errors
+    summaries, errors = LocalTravelerPersistence(
+        directory
+    ).list_summaries_with_errors()
+    return [
+        {
+            "path": summary.snapshot.location if summary.snapshot else None,
+            "job": (
+                copy.deepcopy(summary.snapshot.traveler)
+                if summary.snapshot is not None
+                else None
+            ),
+            "job_number": summary.job_number,
+            "customer": summary.customer,
+            "part_number": summary.part_number,
+            "quantity": summary.quantity,
+            "status": summary.status,
+        }
+        for summary in summaries
+    ], errors
 
 
 def merge_section(job, section_name, changes, timestamp=None):
@@ -994,10 +979,22 @@ class ScrollableFrame(ttk.Frame):
 class JobTravelerApp:
     """Single-window, navigable Job Traveler GUI controller."""
 
-    def __init__(self, root, jobs_directory=None):
+    def __init__(self, root, jobs_directory=None, persistence=None):
         self.root = root
-        self.jobs_directory = get_jobs_directory(jobs_directory)
+        if persistence is not None and not isinstance(persistence, TravelerPersistence):
+            raise TypeError("persistence must implement TravelerPersistence")
+        if persistence is not None and jobs_directory is not None:
+            raise ValueError("Choose an injected persistence implementation or a local path.")
+        if persistence is None:
+            selected_mode = os.environ.get(MODE_ENV, "local").casefold()
+            local_directory = (
+                get_jobs_directory(jobs_directory) if selected_mode == "local" else None
+            )
+            persistence = build_persistence(jobs_directory=local_directory)
+        self.persistence = persistence
+        self.jobs_directory = getattr(self.persistence, "root", None)
         self.current_job = None
+        self.current_snapshot = None
         self.current_path = None
         self.root.title(APP_TITLE)
         # ===== CUSTOMIZE: MAIN WINDOW =====
@@ -1110,13 +1107,13 @@ class JobTravelerApp:
         values = {key: widget.get() for key, widget in entries.items()}
         try:
             job = create_job_record(values)
-            path = traveler_path(job["job_number"], self.jobs_directory)
         except ValidationError as error:
             messagebox.showerror("Invalid Job", str(error), parent=self.root)
             return
 
-        overwrite = False
-        if path.exists():
+        try:
+            result = self.persistence.create(job, overwrite=False)
+        except PersistenceAlreadyExistsError:
             overwrite = messagebox.askyesno(
                 "Traveler Already Exists",
                 f"Job {job['job_number']} already exists. Replace that traveler?",
@@ -1125,18 +1122,22 @@ class JobTravelerApp:
             )
             if not overwrite:
                 return
-
-        try:
-            self.current_path = save_job_data(
-                job, self.jobs_directory, overwrite=overwrite
-            )
-        except (OSError, TypeError, ValueError) as error:
+            try:
+                result = self.persistence.create(job, overwrite=True)
+            except PersistenceError as error:
+                messagebox.showerror(
+                    "Save Error", f"Could not save the traveler:\n\n{error}", parent=self.root
+                )
+                return
+        except PersistenceError as error:
             messagebox.showerror(
                 "Save Error", f"Could not save the traveler:\n\n{error}", parent=self.root
             )
             return
 
-        self.current_job = job
+        self.current_snapshot = result.snapshot
+        self.current_job = copy.deepcopy(result.snapshot.traveler)
+        self.current_path = result.snapshot.location
         self.show_job_detail()
 
     def show_job_list(self):
@@ -1144,11 +1145,27 @@ class JobTravelerApp:
         frame = ttk.Frame(self.root, style="App.TFrame", padding=SPACE_SECTION)
         frame.pack(fill="both", expand=True)
         self.page_header(
-            frame, "Open Existing Job", f"Traveler folder: {self.jobs_directory}"
+            frame,
+            "Open Existing Job",
+            (
+                f"Traveler folder: {self.jobs_directory}"
+                if self.jobs_directory is not None
+                else "Traveler source: authenticated ShopOS service"
+            ),
         )
         try:
-            travelers, errors = list_saved_jobs(self.jobs_directory)
-        except OSError as error:
+            summaries, errors = self.persistence.list_summaries_with_errors()
+            travelers = [
+                {
+                    "job_number": summary.job_number,
+                    "customer": summary.customer,
+                    "part_number": summary.part_number,
+                    "quantity": summary.quantity,
+                    "status": summary.status,
+                }
+                for summary in summaries
+            ]
+        except PersistenceError as error:
             messagebox.showerror(
                 "Open Error", f"Could not read the traveler folder:\n\n{error}", parent=self.root
             )
@@ -1174,14 +1191,14 @@ class JobTravelerApp:
         tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        row_paths = {}
+        row_jobs = {}
         for traveler in travelers:
             item = tree.insert(
                 "",
                 "end",
                 values=tuple(traveler[key] for key in columns),
             )
-            row_paths[item] = traveler["path"]
+            row_jobs[item] = traveler["job_number"]
 
         if not travelers:
             ttk.Label(
@@ -1203,15 +1220,17 @@ class JobTravelerApp:
                     "Open Job", "Select a traveler first.", parent=self.root
                 )
                 return
-            path = row_paths[selection[0]]
+            job_number = row_jobs[selection[0]]
             try:
-                self.current_job = load_job_path(path)
-            except (OSError, UnicodeError, json.JSONDecodeError, ValidationError) as error:
+                snapshot = self.persistence.load(job_number)
+            except PersistenceError as error:
                 messagebox.showerror(
                     "Open Error", f"Could not open the traveler:\n\n{error}", parent=self.root
                 )
                 return
-            self.current_path = path
+            self.current_snapshot = snapshot
+            self.current_job = copy.deepcopy(snapshot.traveler)
+            self.current_path = snapshot.location
             self.show_job_detail()
 
         tree.bind("<Double-1>", open_selected)
@@ -1224,27 +1243,73 @@ class JobTravelerApp:
             buttons, text="Home", style="Action.TButton", command=self.show_home
         ).pack(side="left")
 
-    def _persist_candidate(self, candidate, confirmation=None):
-        """Persist a copy and adopt it only after the disk write succeeds."""
-        if candidate is None:
+    @staticmethod
+    def _conflict_value(value):
+        shown = repr(value)
+        return shown if len(shown) <= 240 else shown[:237] + "..."
+
+    def _resolve_save_conflict(self, conflict, candidate, *, action):
+        """Collect explicit field choices, defaulting each one to authoritative."""
+        active_conflict = conflict
+        while True:
+            for field in active_conflict.conflicts:
+                choice = messagebox.askyesnocancel(
+                    "Save Conflict",
+                    (
+                        f"Field: {field.label}\n\n"
+                        f"Your value: {self._conflict_value(field.intended_value)}\n"
+                        f"Current authoritative value: "
+                        f"{self._conflict_value(field.authoritative_value)}\n\n"
+                        "Choose Yes to deliberately replace the current value.\n"
+                        "Choose No (default) to keep the current value.\n"
+                        "Choose Cancel to make no write."
+                    ),
+                    default=messagebox.NO,
+                    parent=self.root,
+                )
+                if choice is None:
+                    return None
+                if choice is False:
+                    set_conflict_value(
+                        candidate, field.path, field.authoritative_value
+                    )
+            try:
+                return self.persistence.resolve_conflict(
+                    active_conflict, candidate, action=action
+                )
+            except PersistenceConflict as changed_again:
+                # The latest hash becomes the next comparison base.  Nothing is
+                # overwritten merely because the field raced a second time.
+                active_conflict = changed_again
+
+    def _persist_candidate(self, candidate, confirmation=None, *, action="logical_save"):
+        """Persist a copy and adopt it only after confirmed persistence."""
+        if candidate is None or self.current_snapshot is None:
             return False
         try:
-            destination = self.current_path or traveler_path(
-                candidate.get("job_number"), self.jobs_directory
+            result = self.persistence.save(
+                self.current_snapshot, candidate, action=action
             )
-            saved_path = save_job_to_path(
-                candidate,
-                destination,
-                self.jobs_directory,
-                overwrite=True,
-            )
-        except (OSError, TypeError, ValueError) as error:
+        except PersistenceConflict as conflict:
+            try:
+                result = self._resolve_save_conflict(
+                    conflict, candidate, action=action
+                )
+            except PersistenceError as error:
+                messagebox.showerror(
+                    "Save Error", f"Could not save the traveler:\n\n{error}", parent=self.root
+                )
+                return False
+            if result is None:
+                return False
+        except PersistenceError as error:
             messagebox.showerror(
                 "Save Error", f"Could not save the traveler:\n\n{error}", parent=self.root
             )
             return False
-        self.current_job = candidate
-        self.current_path = saved_path
+        self.current_snapshot = result.snapshot
+        self.current_job = copy.deepcopy(result.snapshot.traveler)
+        self.current_path = result.snapshot.location
         if confirmation:
             messagebox.showinfo("Saved", confirmation, parent=self.root)
         return True
@@ -1575,7 +1640,14 @@ class JobTravelerApp:
             except ValidationError as error:
                 messagebox.showerror("Invalid Programming", str(error), parent=self.root)
                 return
-            if self._persist_candidate(candidate, "Programming saved."):
+            save_action = (
+                "plan_resize"
+                if desired_count != programming["operation_count"]
+                else "logical_save"
+            )
+            if self._persist_candidate(
+                candidate, "Programming saved.", action=save_action
+            ):
                 self.show_job_detail()
 
         buttons = ttk.Frame(content)

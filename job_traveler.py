@@ -1,9 +1,19 @@
 # job_traveler.py
-import json
+import copy
 import os
 from datetime import datetime
+from pathlib import Path
 
 JOBS_FOLDER = "jobs"
+
+from traveler_persistence import (
+    MODE_ENV,
+    PersistenceConflict,
+    PersistenceError,
+    TravelerPersistence,
+    build_persistence,
+    set_conflict_value,
+)
 
 from traveler_domain import (  # compatibility re-exports for existing callers
     ALLOWED_OPERATIONS,
@@ -28,6 +38,41 @@ from traveler_domain import (  # compatibility re-exports for existing callers
     resize_operation_plan,
     status_if_missing,
 )
+
+
+_configured_persistence = None
+_loaded_snapshots = {}
+
+
+def configure_persistence(persistence):
+    """Inject one explicit persistence implementation for the terminal session."""
+    global _configured_persistence
+    if not isinstance(persistence, TravelerPersistence):
+        raise TypeError("persistence must implement TravelerPersistence")
+    if _configured_persistence is not persistence:
+        _loaded_snapshots.clear()
+    _configured_persistence = persistence
+
+
+def _jobs_directory():
+    configured = Path(JOBS_FOLDER)
+    return (
+        configured
+        if configured.is_absolute()
+        else Path(__file__).resolve().parent / configured
+    )
+
+
+def _active_persistence(persistence=None):
+    if persistence is not None:
+        if not isinstance(persistence, TravelerPersistence):
+            raise TypeError("persistence must implement TravelerPersistence")
+        return persistence
+    if _configured_persistence is not None:
+        return _configured_persistence
+    selected_mode = os.environ.get(MODE_ENV, "local").casefold()
+    jobs_directory = _jobs_directory() if selected_mode == "local" else None
+    return build_persistence(jobs_directory=jobs_directory)
 
 
 def get_int(prompt):
@@ -243,70 +288,113 @@ def get_existing_int_or_new(section_data, key, prompt):
     return get_int(f"{prompt}: ")
 
 
-def save_job(job):
-    os.makedirs(JOBS_FOLDER, exist_ok=True)
+def _shown_conflict_value(value):
+    shown = repr(value)
+    return shown if len(shown) <= 240 else shown[:237] + "..."
 
-    filename = os.path.join(JOBS_FOLDER, f"{job['job_number']}.json")
 
-    saved_job = canonical_job(job)
-    with open(filename, "w") as file:
-        json.dump(saved_job, file, indent=4)
+def _resolve_terminal_conflict(persistence, conflict, intended, *, action):
+    active_conflict = conflict
+    while True:
+        for field in active_conflict.conflicts:
+            print(f"\nSave conflict in {field.label}")
+            print(f"Your value: {_shown_conflict_value(field.intended_value)}")
+            print(
+                "Current authoritative value: "
+                f"{_shown_conflict_value(field.authoritative_value)}"
+            )
+            while True:
+                choice = input(
+                    "Keep authoritative [Enter/k], deliberately replace [r], "
+                    "or cancel [c]: "
+                ).strip().casefold()
+                if choice in {"", "k"}:
+                    set_conflict_value(intended, field.path, field.authoritative_value)
+                    break
+                if choice == "r":
+                    break
+                if choice == "c":
+                    return None
+                print("Invalid choice. The default is to keep the authoritative value.")
+        try:
+            return persistence.resolve_conflict(
+                active_conflict, intended, action=action
+            )
+        except PersistenceConflict as changed_again:
+            active_conflict = changed_again
+
+
+def save_job(job, persistence=None, *, action="logical_save"):
+    """Save through the configured boundary and report success only if confirmed."""
+    active = _active_persistence(persistence)
+    intended = copy.deepcopy(job)
+    tracked = _loaded_snapshots.get(id(job))
+    base = tracked[1] if tracked is not None and tracked[0] is job else None
+    try:
+        result = (
+            active.save(base, intended, action=action)
+            if base is not None
+            else active.create(intended, overwrite=True)
+        )
+    except PersistenceConflict as conflict:
+        try:
+            result = _resolve_terminal_conflict(
+                active, conflict, intended, action=action
+            )
+        except PersistenceError as error:
+            print(f"\nJob traveler was not saved: {error}")
+            return False
+        if result is None:
+            print("\nSave canceled. No change was written.")
+            return False
+    except PersistenceError as error:
+        print(f"\nJob traveler was not saved: {error}")
+        return False
 
     job.clear()
-    job.update(saved_job)
+    job.update(copy.deepcopy(result.snapshot.traveler))
+    _loaded_snapshots[id(job)] = (job, result.snapshot)
+    destination = (
+        str(result.snapshot.location)
+        if result.snapshot.location is not None
+        else "the authenticated ShopOS service"
+    )
+    print(f"\nSaved job traveler to {destination}")
+    return True
 
-    print(f"\nSaved job traveler to {filename}")
 
-
-def load_job(job_number):
-    filename = os.path.join(JOBS_FOLDER, f"{job_number}.json")
-
-    if not os.path.exists(filename):
-        print(f"\nNo job traveler found for job number {job_number}.")
+def load_job(job_number, persistence=None):
+    active = _active_persistence(persistence)
+    try:
+        snapshot = active.load(str(job_number))
+    except PersistenceError as error:
+        print(f"\nNo job traveler found for job number {job_number}: {error}")
         return None
-
-    with open(filename, "r") as file:
-        job = json.load(file)
-
-    for section in SECTIONS:
-        job.setdefault(section, {})
-
+    job = copy.deepcopy(snapshot.traveler)
+    _loaded_snapshots[id(job)] = (job, snapshot)
     return job
 
 
-def list_existing_jobs():
-    if not os.path.exists(JOBS_FOLDER):
-        print("\nNo saved job travelers found.")
+def list_existing_jobs(persistence=None):
+    active = _active_persistence(persistence)
+    try:
+        summaries, _errors = active.list_summaries_with_errors()
+    except PersistenceError as error:
+        print(f"\nSaved job travelers could not be listed: {error}")
         return
-
-    job_files = [
-        filename
-        for filename in os.listdir(JOBS_FOLDER)
-        if filename.endswith(".json")
-    ]
-
-    if not job_files:
+    if not summaries:
         print("\nNo saved job travelers found.")
         return
 
     print("\nExisting Job Travelers")
     print("-" * 30)
     print("Job Number | Customer | Part Number | Qty To Make")
-
-    for filename in sorted(job_files):
-        path = os.path.join(JOBS_FOLDER, filename)
-
-        try:
-            with open(path, "r") as file:
-                job = json.load(file)
-        except (OSError, json.JSONDecodeError):
-            continue
-
+    for summary in summaries:
         print(
-            f"{job.get('job_number', BLANK)} | "
-            f"{job.get('customer', BLANK)} | "
-            f"{job.get('part_number', BLANK)} | "
-            f"Qty: {job.get('qty_to_make', BLANK)}"
+            f"{summary.job_number or BLANK} | "
+            f"{summary.customer or BLANK} | "
+            f"{summary.part_number or BLANK} | "
+            f"Qty: {summary.quantity if summary.quantity not in ('', None) else BLANK}"
         )
 
 
@@ -331,8 +419,7 @@ def create_new_job():
         "shipping": {},
     }
 
-    save_job(job)
-    return job
+    return job if save_job(job) else None
 
 
 def print_traveler(job):
@@ -530,8 +617,14 @@ def update_programming(job):
         programming.pop(key, None)
     job.clear()
     job.update(candidate)
-    save_job(job)
-    return True
+    return save_job(
+        job,
+        action=(
+            "plan_resize"
+            if operation_count != normalized["programming"]["operation_count"]
+            else "logical_save"
+        ),
+    )
 
 
 def update_saw_cutting(job):
@@ -550,7 +643,7 @@ def update_saw_cutting(job):
         "notes": get_existing_or_new(saw_cutting, "notes", "Notes"),
     }
 
-    save_job(job)
+    return save_job(job)
 
 
 def update_cnc_machining(job):
@@ -604,8 +697,7 @@ def update_cnc_machining(job):
         cnc.pop(key, None)
     job.clear()
     job.update(normalized)
-    save_job(job)
-    return True
+    return save_job(job)
 
 
 def update_deburr(job):
@@ -623,7 +715,7 @@ def update_deburr(job):
         "notes": get_existing_or_new(deburr, "notes", "Notes"),
     }
 
-    save_job(job)
+    return save_job(job)
 
 
 def update_inspection(job):
@@ -716,8 +808,7 @@ def update_inspection(job):
         inspection.pop(key, None)
     job.clear()
     job.update(normalized)
-    save_job(job)
-    return True
+    return save_job(job)
 
 
 def update_packing(job):
@@ -735,7 +826,7 @@ def update_packing(job):
         "notes": get_existing_or_new(packing, "notes", "Notes"),
     }
 
-    save_job(job)
+    return save_job(job)
 
 
 def update_shipping(job):
@@ -754,7 +845,7 @@ def update_shipping(job):
         "notes": get_existing_or_new(shipping, "notes", "Notes"),
     }
 
-    save_job(job)
+    return save_job(job)
 
 
 def show_updated_traveler_and_choose_next(job):
@@ -833,7 +924,8 @@ def job_menu(job):
             print("Invalid choice. Please try again.")
 
 
-def main():
+def main(persistence=None):
+    configure_persistence(_active_persistence(persistence))
     while True:
         print("\nMain Menu")
         print("-" * 30)
@@ -846,7 +938,8 @@ def main():
 
         if choice == "1":
             job = create_new_job()
-            job_menu(job)
+            if job is not None:
+                job_menu(job)
         elif choice == "2":
             job_number = input("Job Number: ").strip()
             job = load_job(job_number)
