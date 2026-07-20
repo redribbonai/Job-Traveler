@@ -1,0 +1,83 @@
+{
+  "job_number": "SANITIZED-MULTI",
+  "customer": "Example Customer",
+  "part_number": "EXAMPLE-PART-B",
+  "description": "Sanitized multi-operation fixture",
+  "qty_to_make": 8,
+  "material": "Example Material",
+  "cut_length": "6.00",
+  "programming": {
+    "programmer": "Example Programmer",
+    "operation_count": 2,
+    "operations": [
+      {
+        "operation_number": 1,
+        "operation_type": "Mill",
+        "program_name": "EXAMPLE-OP10",
+        "revision": "A",
+        "status": "Completed",
+        "last_updated": "2026-01-06 08:00",
+        "notes": "",
+        "compatible_operation_extension": "preserve"
+      },
+      {
+        "operation_number": 2,
+        "operation_type": "Turning",
+        "program_name": "EXAMPLE-OP20",
+        "revision": "B",
+        "status": "In Progress",
+        "last_updated": "2026-01-06 09:00",
+        "notes": ""
+      }
+    ]
+  },
+  "saw_cutting": {
+    "status": "Completed"
+  },
+  "cnc_machining": {
+    "operations": [
+      {
+        "operation_number": 1,
+        "operator": "Example Operator",
+        "machine": "DNM 4500",
+        "qty_complete": 8,
+        "status": "Completed",
+        "last_updated": "2026-01-06 10:00",
+        "notes": ""
+      },
+      {
+        "operation_number": 2,
+        "operator": "Example Operator",
+        "machine": "Haas ST15Y",
+        "qty_complete": 3,
+        "status": "In Progress",
+        "last_updated": "2026-01-06 11:00",
+        "notes": ""
+      }
+    ]
+  },
+  "deburr": {},
+  "inspection": {
+    "records": [
+      {
+        "operation_number": 1,
+        "operation_type": "Mill",
+        "machine": "DNM 4500",
+        "inspector": "Example Inspector",
+        "report_type": "In Process Inspection",
+        "status": "Completed",
+        "last_updated": "2026-01-06 12:00",
+        "notes": "",
+        "dimensions": [],
+        "compatible_inspection_extension": {
+          "preserve": true
+        }
+      }
+    ]
+  },
+  "packing": {},
+  "shipping": {},
+  "compatible_top_level": {
+    "preserve": true
+  }
+}

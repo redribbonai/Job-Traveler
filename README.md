@@ -53,6 +53,36 @@ the old Programming machine used only when the CNC machine is blank. Files are
 not rewritten just by opening or printing them; the normalized structure is
 saved after an actual workflow update.
 
+### Shared domain contract
+
+`traveler_domain.py` is the single pure compatibility contract shared by the
+terminal application, Tkinter application, and the ShopOS read service. It owns
+the seven section names, allowed statuses and operation types, official machine
+lists, legacy/current normalization, canonical save representation, operation
+resizing, structural validation, status derivation, and read-model helpers. It
+does not import Tkinter, read or write files, prompt, print, or launch windows.
+All normalization functions return copies; importing or reading the contract
+cannot rewrite a traveler.
+
+`job_traveler.py` continues to re-export the existing public constants and
+functions, so terminal and GUI callers keep their current imports and behavior.
+Sanitized legacy and canonical fixtures under `test_fixtures/` cover the shared
+contract without depending on ignored shop jobs.
+
+Legacy compatibility intentionally tolerates missing sections, numeric-string
+operation counts, missing positional operation numbers, and missing or unknown
+status values (reported as `Pending` in the derived status view). The explicit
+storage validator rejects non-object sections, non-object operation rows,
+invalid present operation numbers, and duplicate operation numbers rather than
+normalizing those protected structures away. The desktop normalizer retains its
+older permissive direct-call behavior for compatibility; storage/API consumers
+must validate before normalizing untrusted files.
+
+Operation references emitted by the read model are derived from section plus
+the current positional operation number. They are explicitly temporary
+compatibility coordinates, not stable UUIDs. No identifier, revision, closure,
+Task, or `_shopos` metadata is persisted in this phase.
+
 Scrap, reject, and fail numbers are not printed on the public traveler. They may be used later for private boss reports.
 
 ## How to Run

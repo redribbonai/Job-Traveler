@@ -1,0 +1,47 @@
+{
+  "job_number": "SANITIZED-LEGACY",
+  "customer": "Example Customer",
+  "part_number": "EXAMPLE-PART-A",
+  "description": "Sanitized single-operation fixture",
+  "qty_to_make": 12,
+  "material": "Example Material",
+  "cut_length": "4.25",
+  "programming": {
+    "programmer": "Example Programmer",
+    "program_name": "EXAMPLE-OP10",
+    "revision": "A",
+    "machine": "DNM 5700L",
+    "status": "Completed",
+    "last_updated": "2026-01-05 08:00",
+    "notes": "Sanitized note",
+    "compatible_extension": {
+      "preserve": true
+    }
+  },
+  "saw_cutting": {
+    "status": "Completed"
+  },
+  "cnc_machining": {
+    "operator": "Example Operator",
+    "machine": "DNM 4500",
+    "qty_completed": 12,
+    "status": "Completed"
+  },
+  "deburr": {},
+  "inspection": {
+    "inspector": "Example Inspector",
+    "report_type": "Final Inspection",
+    "operation": "Mill",
+    "machine": "DNM 4500",
+    "status": "Completed",
+    "last_updated": "2026-01-05 08:00",
+    "dimensions": []
+  },
+  "packing": {},
+  "shipping": {},
+  "compatible_top_level": {
+    "nested": {
+      "preserve": "yes"
+    }
+  }
+}

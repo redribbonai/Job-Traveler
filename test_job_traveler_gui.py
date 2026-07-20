@@ -344,16 +344,16 @@ class MultiOperationTravelerTests(unittest.TestCase):
         self.assertEqual(gui_theme.SELECTION, "#2962FF")
         self.assertEqual(gui.display_value(terminal_app.BLANK), "—")
 
-    def test_job_777_normalizes_for_structured_preview_without_rewrite(self):
-        path = self.repository / "jobs" / "777.json"
+    def test_sanitized_legacy_fixture_normalizes_for_preview_without_rewrite(self):
+        path = self.repository / "test_fixtures" / "legacy" / "SANITIZED-LEGACY.json"
         before = path.read_bytes()
         job = gui.load_job_path(path)
-        self.assertEqual(job["job_number"], "777")
+        self.assertEqual(job["job_number"], "SANITIZED-LEGACY")
         self.assertEqual(len(job["programming"]["operations"]), 1)
         self.assertEqual(len(job["inspection"]["records"]), 1)
         self.assertEqual(
             gui.format_shop_timestamp(job["inspection"]["records"][0]["last_updated"]),
-            "Jul 3, 2026 at 4:49 AM EDT",
+            "Jan 5, 2026 at 8:00 AM EST",
         )
         self.assertEqual(path.read_bytes(), before)
 

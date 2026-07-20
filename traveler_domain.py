@@ -1,0 +1,681 @@
+"""Pure, reusable Job Traveler domain and compatibility contract.
+
+This module deliberately performs no filesystem access and imports no UI toolkit.
+Normalization always returns a deep copy and never persists its result.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+from typing import Any
+
+
+DOMAIN_CONTRACT_NAME = "rr-shopos-job-traveler"
+DOMAIN_CONTRACT_VERSION = 1
+
+BLANK = "__________"
+SECTIONS = [
+    "programming",
+    "saw_cutting",
+    "cnc_machining",
+    "deburr",
+    "inspection",
+    "packing",
+    "shipping",
+]
+ALLOWED_STATUSES = ["Pending", "In Progress", "Completed"]
+ALLOWED_OPERATIONS = ["Mill", "Turning"]
+MILLING_MACHINES = [
+    "Haas VF2 SS",
+    "DNM 5700L",
+    "DNM 4500",
+    "Mazak VC-EZ26",
+]
+TURNING_MACHINES = [
+    "Haas ST15Y",
+    "Lynx 2100LSY #1",
+    "Lynx 2100LSY #2",
+    "Puma 2600 SY2",
+    "Puma TT 1300 SYYB",
+]
+ALL_MACHINES = MILLING_MACHINES + TURNING_MACHINES
+
+
+class TravelerValidationError(ValueError):
+    """Raised when a protected traveler structure is unsafe to interpret."""
+
+
+def blank_programming_operation(operation_number: int) -> dict[str, Any]:
+    return {
+        "operation_number": operation_number,
+        "operation_type": "",
+        "program_name": "",
+        "revision": "",
+        "status": "Pending",
+        "last_updated": "",
+        "notes": "",
+    }
+
+
+def blank_cnc_operation(operation_number: int) -> dict[str, Any]:
+    return {
+        "operation_number": operation_number,
+        "operator": "",
+        "machine": "",
+        "qty_complete": 0,
+        "status": "Pending",
+        "last_updated": "",
+        "notes": "",
+    }
+
+
+def infer_operation_type(*values: object) -> str:
+    """Infer a legacy operation type without inventing a machine."""
+    for value in values:
+        if value in ALLOWED_OPERATIONS:
+            return str(value)
+        if value in MILLING_MACHINES:
+            return "Mill"
+        if value in TURNING_MACHINES:
+            return "Turning"
+    return ""
+
+
+def operation_by_number(
+    operations: list[dict[str, Any]], operation_number: int
+) -> dict[str, Any] | None:
+    for operation in operations:
+        if operation.get("operation_number") == operation_number:
+            return operation
+    return None
+
+
+def normalize_operations(job: dict[str, Any]) -> dict[str, Any]:
+    """Return a normalized copy; merely loading a legacy job never rewrites it.
+
+    The permissive conversions here intentionally retain the desktop applications'
+    historical behavior. Call :func:`validate_traveler_structure` before using
+    untrusted storage when malformed protected fields must be rejected.
+    """
+    normalized = copy.deepcopy(job)
+    for section in SECTIONS:
+        normalized.setdefault(section, {})
+
+    programming = normalized.get("programming")
+    if not isinstance(programming, dict):
+        programming = {}
+    raw_programming_operations = programming.get("operations")
+    if isinstance(raw_programming_operations, list) and raw_programming_operations:
+        programming_operations = []
+        for number, raw in enumerate(raw_programming_operations, start=1):
+            operation = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+            operation["operation_number"] = number
+            operation.setdefault("operation_type", operation.pop("operation", ""))
+            for key, default in blank_programming_operation(number).items():
+                operation.setdefault(key, default)
+            programming_operations.append(operation)
+    else:
+        operation = blank_programming_operation(1)
+        operation.update(
+            {
+                "operation_type": infer_operation_type(
+                    programming.get("operation"), programming.get("machine")
+                ),
+                "program_name": programming.get("program_name", ""),
+                "revision": programming.get("revision", ""),
+                "status": programming.get("status", "Pending"),
+                "last_updated": programming.get("last_updated", ""),
+                "notes": programming.get("notes", ""),
+            }
+        )
+        programming_operations = [operation]
+    try:
+        requested_count = int(
+            programming.get("operation_count", len(programming_operations))
+        )
+    except (TypeError, ValueError):
+        requested_count = len(programming_operations)
+    requested_count = max(1, requested_count, len(programming_operations))
+    while len(programming_operations) < requested_count:
+        programming_operations.append(
+            blank_programming_operation(len(programming_operations) + 1)
+        )
+    programming["programmer"] = programming.get("programmer", "")
+    programming["operation_count"] = len(programming_operations)
+    programming["operations"] = programming_operations
+    normalized["programming"] = programming
+
+    cnc = normalized.get("cnc_machining")
+    if not isinstance(cnc, dict):
+        cnc = {}
+    raw_cnc_operations = cnc.get("operations")
+    if isinstance(raw_cnc_operations, list):
+        cnc_operations = []
+        for number, raw in enumerate(raw_cnc_operations, start=1):
+            operation = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+            operation["operation_number"] = number
+            if "qty_complete" not in operation:
+                operation["qty_complete"] = operation.pop("qty_completed", 0)
+            for key, default in blank_cnc_operation(number).items():
+                operation.setdefault(key, default)
+            operation.pop("first_article", None)
+            cnc_operations.append(operation)
+    else:
+        operation = blank_cnc_operation(1)
+        legacy_machine = cnc.get("machine") or programming.get("machine", "")
+        operation.update(
+            {
+                "operator": cnc.get("operator", ""),
+                "machine": legacy_machine,
+                "qty_complete": cnc.get(
+                    "qty_complete", cnc.get("qty_completed", 0)
+                ),
+                "status": cnc.get("status", "Pending"),
+                "last_updated": cnc.get("last_updated", ""),
+                "notes": cnc.get("notes", ""),
+            }
+        )
+        cnc_operations = [operation]
+    while len(cnc_operations) < len(programming_operations):
+        cnc_operations.append(blank_cnc_operation(len(cnc_operations) + 1))
+    cnc["operations"] = cnc_operations
+    normalized["cnc_machining"] = cnc
+
+    inspection = normalized.get("inspection")
+    if not isinstance(inspection, dict):
+        inspection = {}
+    raw_records = inspection.get("records")
+    if isinstance(raw_records, list):
+        records = []
+        for row in raw_records:
+            if not isinstance(row, dict):
+                continue
+            record = copy.deepcopy(row)
+            try:
+                operation_number = int(record.get("operation_number"))
+            except (TypeError, ValueError):
+                continue
+            programming_operation = operation_by_number(
+                programming_operations, operation_number
+            )
+            cnc_operation = operation_by_number(cnc_operations, operation_number)
+            if programming_operation is None:
+                continue
+            record["operation_number"] = operation_number
+            record.setdefault(
+                "operation_type", programming_operation.get("operation_type", "")
+            )
+            record.setdefault(
+                "machine", cnc_operation.get("machine", "") if cnc_operation else ""
+            )
+            record.setdefault("dimensions", [])
+            records.append(record)
+    elif any(
+        key in inspection
+        for key in ("inspector", "dimensions", "operation", "machine", "status")
+    ):
+        records = [
+            {
+                "operation_number": 1,
+                "operation_type": infer_operation_type(
+                    inspection.get("operation"),
+                    programming_operations[0]["operation_type"],
+                ),
+                "machine": inspection.get("machine")
+                or cnc_operations[0].get("machine", ""),
+                "inspector": inspection.get("inspector", ""),
+                "report_type": inspection.get("report_type", ""),
+                "status": inspection.get("status", "Pending"),
+                "last_updated": inspection.get("last_updated", ""),
+                "notes": inspection.get("notes", ""),
+                "dimensions": copy.deepcopy(inspection.get("dimensions", [])),
+            }
+        ]
+    else:
+        records = []
+    inspection["records"] = records
+    normalized["inspection"] = inspection
+    return normalized
+
+
+def canonical_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Return the existing save schema while retaining compatible unknown fields."""
+    canonical = normalize_operations(job)
+    programming = canonical["programming"]
+    for key in (
+        "program_name",
+        "revision",
+        "operation",
+        "machine",
+        "status",
+        "last_updated",
+        "notes",
+    ):
+        programming.pop(key, None)
+    cnc = canonical["cnc_machining"]
+    for key in (
+        "operator",
+        "machine",
+        "qty_completed",
+        "qty_complete",
+        "status",
+        "last_updated",
+        "notes",
+        "first_article",
+    ):
+        cnc.pop(key, None)
+    inspection = canonical["inspection"]
+    for key in (
+        "inspector",
+        "report_type",
+        "operation",
+        "machine",
+        "status",
+        "dimensions",
+        "notes",
+        "last_updated",
+    ):
+        inspection.pop(key, None)
+    return canonical
+
+
+def operation_has_data(
+    operation: object, ignored: tuple[str, ...] = ("operation_number",)
+) -> bool:
+    if not isinstance(operation, dict):
+        return False
+    for key, value in operation.items():
+        if key in ignored:
+            continue
+        if value not in ("", None, 0, "Pending", []):
+            return True
+    return False
+
+
+def resize_operation_plan(
+    job: dict[str, Any], new_count: int, confirm_removal: bool = False
+) -> dict[str, Any]:
+    """Resize a normalized plan, refusing to discard downstream records."""
+    if isinstance(new_count, bool) or not isinstance(new_count, int) or new_count <= 0:
+        raise ValueError("Number of Operations Required must be a positive whole number.")
+    normalized = normalize_operations(job)
+    programming = normalized["programming"]
+    old_count = programming["operation_count"]
+    if new_count < old_count:
+        removed = set(range(new_count + 1, old_count + 1))
+        used_cnc = [
+            row.get("operation_number")
+            for row in normalized["cnc_machining"]["operations"]
+            if row.get("operation_number") in removed and operation_has_data(row)
+        ]
+        used_inspection = [
+            row.get("operation_number")
+            for row in normalized["inspection"]["records"]
+            if row.get("operation_number") in removed and operation_has_data(row)
+        ]
+        if used_cnc or used_inspection:
+            numbers = sorted(set(used_cnc + used_inspection))
+            raise ValueError(
+                "Cannot reduce operations because production or inspection data exists "
+                f"for Operation(s) {', '.join(map(str, numbers))}."
+            )
+        if not confirm_removal:
+            raise ValueError("Confirm removal of the unused blank operation(s).")
+        programming["operations"] = programming["operations"][:new_count]
+        normalized["cnc_machining"]["operations"] = [
+            row
+            for row in normalized["cnc_machining"]["operations"]
+            if row.get("operation_number", 0) <= new_count
+        ]
+        normalized["inspection"]["records"] = [
+            row
+            for row in normalized["inspection"]["records"]
+            if row.get("operation_number", 0) <= new_count
+        ]
+    else:
+        while len(programming["operations"]) < new_count:
+            programming["operations"].append(
+                blank_programming_operation(len(programming["operations"]) + 1)
+            )
+        while len(normalized["cnc_machining"]["operations"]) < new_count:
+            normalized["cnc_machining"]["operations"].append(
+                blank_cnc_operation(
+                    len(normalized["cnc_machining"]["operations"]) + 1
+                )
+            )
+    programming["operation_count"] = new_count
+    return normalized
+
+
+def get_required_quantity(job: dict[str, Any]) -> int | None:
+    try:
+        return int(job.get("qty_to_make"))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_cnc_status(
+    job: dict[str, Any], qty_completed: int, current_status: str
+) -> str:
+    required_quantity = get_required_quantity(job)
+    if qty_completed <= 0:
+        if current_status == "In Progress":
+            return "In Progress"
+        return "Pending"
+    if required_quantity is None:
+        return "In Progress"
+    if qty_completed >= required_quantity:
+        return "Completed"
+    return "In Progress"
+
+
+def blank_if_missing(job: dict[str, Any], section: str, key: str) -> object:
+    value = job.get(section, {}).get(key)
+    return BLANK if value == "" or value is None else value
+
+
+def status_if_missing(job: dict[str, Any], section: str) -> str:
+    section_data = job.get(section, {})
+    if isinstance(section_data, dict):
+        rows = None
+        if section in ("programming", "cnc_machining"):
+            rows = section_data.get("operations")
+        elif section == "inspection":
+            rows = section_data.get("records")
+        if isinstance(rows, list) and rows:
+            statuses = [
+                row.get("status", "Pending") if isinstance(row, dict) else "Pending"
+                for row in rows
+            ]
+            if all(value == "Completed" for value in statuses):
+                return "Completed"
+            if any(value in ("In Progress", "Completed") for value in statuses):
+                return "In Progress"
+            return "Pending"
+    value = section_data.get("status") if isinstance(section_data, dict) else None
+    if value == "" or value is None or value not in ALLOWED_STATUSES:
+        return "Pending"
+    return value
+
+
+def operation_if_missing(job: dict[str, Any], section: str) -> object:
+    value = job.get(section, {}).get("operation")
+    if value == "" or value is None or value not in ALLOWED_OPERATIONS:
+        return BLANK
+    return value
+
+
+def job_field(job: dict[str, Any], key: str) -> object:
+    value = job.get(key)
+    return BLANK if value == "" or value is None else value
+
+
+def _first_available_value(job: dict[str, Any], names: tuple[str, ...]) -> object:
+    for name in names:
+        if name not in job:
+            continue
+        value = job[name]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        return value
+    return None
+
+
+def _required_identifier(value: object, label: str) -> str:
+    if isinstance(value, bool) or isinstance(value, (dict, list)):
+        raise TravelerValidationError(f"{label} must be text or a whole number")
+    if not isinstance(value, (str, int)):
+        raise TravelerValidationError(f"{label} must be text or a whole number")
+    normalized = str(value).strip()
+    if not normalized:
+        raise TravelerValidationError(f"{label} is required")
+    return normalized
+
+
+def _positive_whole_number(value: object) -> int:
+    if isinstance(value, bool):
+        raise TravelerValidationError("Quantity to make must be a positive whole number")
+    if isinstance(value, int):
+        quantity = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise TravelerValidationError(
+                "Quantity to make must be a positive whole number"
+            )
+        quantity = int(value)
+    elif isinstance(value, str):
+        try:
+            quantity = int(value.strip())
+        except (TypeError, ValueError) as error:
+            raise TravelerValidationError(
+                "Quantity to make must be a positive whole number"
+            ) from error
+    else:
+        raise TravelerValidationError("Quantity to make must be a positive whole number")
+    if quantity <= 0:
+        raise TravelerValidationError("Quantity to make must be a positive whole number")
+    return quantity
+
+
+def _optional_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def parts_count_projection(job: object) -> dict[str, Any]:
+    """Return the established Parts Count header projection from a traveler."""
+    if not isinstance(job, dict):
+        raise TravelerValidationError("The job file must contain a JSON object")
+    return {
+        "job_number": _required_identifier(
+            _first_available_value(job, ("job_number", "job_num")), "Job number"
+        ),
+        "part_number": _required_identifier(
+            _first_available_value(job, ("part_number", "part_num")), "Part number"
+        ),
+        "qty_to_make": _positive_whole_number(
+            _first_available_value(job, ("qty_to_make", "part_total", "quantity"))
+        ),
+        "customer": _optional_text(job.get("customer")),
+        "description": _optional_text(job.get("description")),
+    }
+
+
+def _validate_operation_rows(section: dict[str, Any], key: str, label: str) -> None:
+    if key not in section:
+        return
+    rows = section[key]
+    if not isinstance(rows, list):
+        raise TravelerValidationError(f"{label}.{key} must contain a JSON array.")
+    seen: set[int] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise TravelerValidationError(
+                f"{label}.{key}[{index}] must contain a JSON object."
+            )
+        if "operation_number" not in row:
+            continue
+        number = row["operation_number"]
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            raise TravelerValidationError(
+                f"{label}.{key}[{index}].operation_number must be a positive whole number."
+            )
+        if number in seen:
+            raise TravelerValidationError(
+                f"{label}.{key} contains duplicate operation number {number}."
+            )
+        seen.add(number)
+
+
+def validate_traveler_structure(value: object) -> None:
+    """Validate protected current/legacy structure without normalizing the source."""
+    if not isinstance(value, dict):
+        raise TravelerValidationError("The Job Traveler file must contain a JSON object.")
+    parts_count_projection(value)
+    for section_name in SECTIONS:
+        if section_name in value and not isinstance(value[section_name], dict):
+            raise TravelerValidationError(
+                f"Traveler section '{section_name}' must contain a JSON object."
+            )
+    programming = value.get("programming", {})
+    cnc = value.get("cnc_machining", {})
+    inspection = value.get("inspection", {})
+    if isinstance(programming, dict):
+        _validate_operation_rows(programming, "operations", "programming")
+        if "operation_count" in programming:
+            raw_count = programming["operation_count"]
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError) as error:
+                raise TravelerValidationError(
+                    "programming.operation_count must be a positive whole number."
+                ) from error
+            if isinstance(raw_count, bool) or count <= 0:
+                raise TravelerValidationError(
+                    "programming.operation_count must be a positive whole number."
+                )
+    if isinstance(cnc, dict):
+        _validate_operation_rows(cnc, "operations", "cnc_machining")
+    if isinstance(inspection, dict):
+        _validate_operation_rows(inspection, "records", "inspection")
+
+
+def section_statuses(job: dict[str, Any]) -> dict[str, str]:
+    """Return current derived status for each of the seven sections."""
+    normalized = normalize_operations(job)
+    return {section: status_if_missing(normalized, section) for section in SECTIONS}
+
+
+def _derived_status(value: object) -> str:
+    return str(value) if value in ALLOWED_STATUSES else "Pending"
+
+
+def operation_descriptors(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return deterministic, explicitly temporary operation references.
+
+    References are compatibility coordinates derived from section and current
+    positional operation number. They are not stable UUIDs and must not be used
+    as permanent Task identities.
+    """
+    normalized = normalize_operations(job)
+    programming = normalized["programming"]["operations"]
+    cnc = normalized["cnc_machining"]["operations"]
+    inspection = normalized["inspection"]["records"]
+    descriptors: list[dict[str, Any]] = []
+
+    def append_fixed(section: str) -> None:
+        descriptors.append(
+            {
+                "compatibility_reference": section,
+                "reference_stability": "temporary_positional",
+                "section": section,
+                "operation_number": None,
+                "operation_type": None,
+                "machine": None,
+                "status": status_if_missing(normalized, section),
+            }
+        )
+
+    for row in programming:
+        number = row["operation_number"]
+        descriptors.append(
+            {
+                "compatibility_reference": f"programming:operation:{number}",
+                "reference_stability": "temporary_positional",
+                "section": "programming",
+                "operation_number": number,
+                "operation_type": row.get("operation_type", ""),
+                "machine": None,
+                "status": _derived_status(row.get("status")),
+            }
+        )
+    append_fixed("saw_cutting")
+    for row in cnc:
+        number = row["operation_number"]
+        programming_row = operation_by_number(programming, number) or {}
+        descriptors.append(
+            {
+                "compatibility_reference": f"cnc_machining:operation:{number}",
+                "reference_stability": "temporary_positional",
+                "section": "cnc_machining",
+                "operation_number": number,
+                "operation_type": programming_row.get("operation_type", ""),
+                "machine": row.get("machine", ""),
+                "status": _derived_status(row.get("status")),
+            }
+        )
+    append_fixed("deburr")
+    inspection_by_number = {
+        row.get("operation_number"): row for row in inspection if isinstance(row, dict)
+    }
+    for programming_row in programming:
+        number = programming_row["operation_number"]
+        row = inspection_by_number.get(number, {})
+        cnc_row = operation_by_number(cnc, number) or {}
+        descriptors.append(
+            {
+                "compatibility_reference": f"inspection:operation:{number}",
+                "reference_stability": "temporary_positional",
+                "section": "inspection",
+                "operation_number": number,
+                "operation_type": row.get(
+                    "operation_type", programming_row.get("operation_type", "")
+                ),
+                "machine": row.get("machine", cnc_row.get("machine", "")),
+                "status": _derived_status(row.get("status")),
+            }
+        )
+    append_fixed("packing")
+    append_fixed("shipping")
+    return descriptors
+
+
+def read_model(job: object) -> dict[str, Any]:
+    """Validate and build the reusable normalized and derived read model."""
+    validate_traveler_structure(job)
+    assert isinstance(job, dict)
+    normalized = normalize_operations(job)
+    return {
+        "normalized": normalized,
+        "section_statuses": section_statuses(normalized),
+        "operations": operation_descriptors(normalized),
+    }
+
+
+__all__ = [
+    "ALLOWED_OPERATIONS",
+    "ALLOWED_STATUSES",
+    "ALL_MACHINES",
+    "BLANK",
+    "DOMAIN_CONTRACT_NAME",
+    "DOMAIN_CONTRACT_VERSION",
+    "MILLING_MACHINES",
+    "SECTIONS",
+    "TURNING_MACHINES",
+    "TravelerValidationError",
+    "blank_cnc_operation",
+    "blank_if_missing",
+    "blank_programming_operation",
+    "canonical_job",
+    "get_cnc_status",
+    "get_required_quantity",
+    "infer_operation_type",
+    "job_field",
+    "normalize_operations",
+    "operation_by_number",
+    "operation_descriptors",
+    "operation_has_data",
+    "operation_if_missing",
+    "parts_count_projection",
+    "read_model",
+    "resize_operation_plan",
+    "section_statuses",
+    "status_if_missing",
+    "validate_traveler_structure",
+]
